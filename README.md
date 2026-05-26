@@ -1,8 +1,6 @@
-# Qbert0G QRNG gRPC Service
+# Qbert0G
 
-A gRPC service that streams **freshly measured quantum noise** from Crypta Labs devices (Firefly and QCicada). Built for quantum and entropy research — not for cryptography.
-
-Each response carries raw bytes sampled at request time, tagged with the source `device_id` and a microsecond `timestamp`, so every byte is traceable to a specific device and measurement window.
+A gRPC service that streams **freshly measured quantum noise** from Crypta Labs QRNG devices (Firefly and QCicada). This is built for research.
 
 > **Not for cryptographic or security use.**
 > Output is intentionally **not NIST SP 800-90B compliant**. If you need a cryptographic RNG, look elsewhere.
@@ -15,6 +13,8 @@ Each response carries raw bytes sampled at request time, tagged with the source 
 - **Multiple post-processing modes** — raw noise (zero post-processing), with noise conditioning, or SHA-256 post-processed. Selectable per device, for research needs
 - **Device failover** — automatic fallback across configured devices
 - **API key management** — per-key rate limits, daily byte caps, and per-request byte caps, with usage tracked in SQLite
+
+Each response carries raw bytes sampled at request time, tagged with the source `device_id` and a microsecond `timestamp`, so every byte is traceable to a specific device and measurement window.
 
 ## Architecture
 
