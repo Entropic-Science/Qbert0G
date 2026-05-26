@@ -1,4 +1,4 @@
-# Qbert0G gRPC QRNG Service
+# Qbert0G QRNG gRPC Service
 
 A gRPC service that streams **freshly measured quantum noise** from Crypta Labs devices (Firefly and QCicada). Built for quantum and entropy research — not for cryptography.
 
