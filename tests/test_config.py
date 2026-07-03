@@ -84,6 +84,73 @@ class TestRejections:
             Config.load(tmp_path / "nope.yaml")
 
 
+class TestChardev:
+    """PCIe Dragonfly char-device entries (type `chardev`)."""
+
+    def test_chardev_accepted_with_pci_address(self):
+        config = Config.from_dict(
+            {
+                "devices": [
+                    {
+                        "id": "dragonfly-0",
+                        "type": "chardev",
+                        "path": "/dev/qrngDF0",
+                        "pci_address": "0000:09:00.0",
+                    }
+                ]
+            }
+        )
+        assert config.devices[0].type == "chardev"
+        assert config.devices[0].pci_address == "0000:09:00.0"
+
+    def test_pci_address_defaults_to_none(self):
+        config = Config.from_dict(
+            {"devices": [{"id": "df-0", "type": "chardev", "path": "/dev/qrngDF0"}]}
+        )
+        assert config.devices[0].pci_address is None
+
+    def test_chardev_requires_path(self):
+        with pytest.raises(ConfigError, match="path"):
+            Config.from_dict({"devices": [{"id": "df-0", "type": "chardev"}]})
+
+    def test_pci_address_rejected_on_non_chardev_types(self):
+        for dev_type, path in [("mock", ""), ("dragonfly", "/dev/ttyQRNG0")]:
+            with pytest.raises(ConfigError, match="pci_address"):
+                Config.from_dict(
+                    {
+                        "devices": [
+                            {
+                                "id": "d0",
+                                "type": dev_type,
+                                "path": path,
+                                "pci_address": "0000:09:00.0",
+                            }
+                        ]
+                    }
+                )
+
+    def test_post_processing_rejected_on_chardev(self):
+        # chardev has no qcc-cli -P chain: it serves whatever the DMA delivers.
+        with pytest.raises(ConfigError, match="post_processing"):
+            Config.from_dict(
+                {
+                    "devices": [
+                        {
+                            "id": "df-0",
+                            "type": "chardev",
+                            "path": "/dev/qrngDF0",
+                            "post_processing": "raw",
+                        }
+                    ]
+                }
+            )
+
+    def test_chardev_has_no_oneshot_limit(self):
+        from qbert0g.config import ONE_SHOT_LIMITS
+
+        assert "chardev" not in ONE_SHOT_LIMITS
+
+
 class TestExampleConfig:
     def test_shipped_example_parses(self):
         from pathlib import Path

@@ -214,11 +214,16 @@ def _cmd_check_config(args: argparse.Namespace) -> None:
     print(f"  bootstrap admin:  {'yes' if config.auth.api_key else 'no'}")
     print(f"  devices:          {len(config.devices)}")
     for dev in config.devices:
-        mode = dev.post_processing or config.post_processing_mode
+        if dev.type == "chardev":
+            # No qcc post-processing chain; DMA output served as-is.
+            mode = "n/a (raw DMA)"
+            extra = f"pci_address={dev.pci_address}" if dev.pci_address else "no pci_address"
+        else:
+            mode = dev.post_processing or config.post_processing_mode
+            extra = "streaming" if dev.streaming_mode else "one-shot"
         print(
             f"    - {dev.id} ({dev.type}, {dev.path or 'no path'}, "
-            f"post_processing={mode}, "
-            f"{'streaming' if dev.streaming_mode else 'one-shot'})"
+            f"post_processing={mode}, {extra})"
         )
 
 

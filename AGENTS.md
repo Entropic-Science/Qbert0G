@@ -7,7 +7,7 @@ one shared request pipeline. ~2k LOC, no framework magic.
 
 ```bash
 python -m ruff check .
-python -m pytest tests/ -q        # 46 tests, no hardware needed (mock device)
+python -m pytest tests/ -q        # no hardware needed (mock device + tmp fixtures)
 ```
 
 Or `make check`. A change is not done until both pass.
@@ -26,8 +26,12 @@ all of the above ──► config.py   (config.py imports nothing internal)
 - `database.py` — API keys (SHA-256 hashed) + usage in SQLite. No singleton:
   `Database(path)`, `connect(bootstrap_admin_key=...)`.
 - `devices.py` — `DeviceManager(config)`: pyqcc drivers (firefly / qcicada /
-  dragonfly) + `MockDevice` (os.urandom, dev only). Per-device asyncio locks,
-  failover routing, freshness flush before EVERY read (config-gated).
+  dragonfly), `ChardevDevice` (PCIe Dragonfly at `/dev/qrngDF*`; DMA reads,
+  no pyqcc/post-processing; sysfs `ready_count` drain + `error_present`/
+  `error_bits` health snapshot when `pci_address` is set) + `MockDevice`
+  (os.urandom, dev only). Per-device asyncio locks, failover routing,
+  freshness flush before EVERY read (config-gated) — `_flush_input` is the
+  single pre-measurement seam for all device types.
 - `gate.py` — `RequestGate.measure(context, n)`: auth → rate limit → byte
   caps → device read → usage record. **Every RPC of both services goes
   through this one method**; never add a second validation path.
@@ -67,10 +71,13 @@ Load-bearing details:
 
 ## How to extend
 
-- **New device type**: add to `DEVICE_TYPES` (+ `ONE_SHOT_LIMITS` if qcc),
+- **New device type**: add to `DEVICE_TYPES` (+ `QCC_DEVICE_TYPES` and
+  `ONE_SHOT_LIMITS` if qcc-driven; types without a limit are unbounded),
   branch in `DeviceManager._connect_device` if it needs a different driver.
   Mock-style drivers just need `start_one_shot / start_continuous /
-  read_continuous / stop / close_comm`.
+  read_continuous / stop / close_comm` (see `ChardevDevice` for a minimal
+  non-serial example). Pre-measurement behavior (freshness/health) goes in
+  `_flush_input`, never in a second seam.
 - **New config key**: add the field to the dataclass in `config.py`, the key
   to the `_check_keys` allowlist, a default, and a test in `tests/test_config.py`.
 - **New RPC/service**: implement the servicer in `server.py`, route every

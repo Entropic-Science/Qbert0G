@@ -27,11 +27,15 @@ POST_PROCESSING_MODES = {"sha256": 0, "raw": 1, "raw_samples": 2}
 #: Device types driven through pyqcc's qcc serial protocol.
 QCC_DEVICE_TYPES = frozenset({"firefly", "qcicada", "dragonfly"})
 
-#: All accepted device types (``mock`` is software-only, NOT quantum).
-DEVICE_TYPES = QCC_DEVICE_TYPES | {"mock"}
+#: All accepted device types. ``mock`` is software-only, NOT quantum.
+#: ``chardev`` is a PCIe Dragonfly exposed as a plain character device
+#: (``/dev/qrngDF*``) — no pyqcc, no qcc-cli post-processing chain; it
+#: serves whatever the driver DMA delivers.
+DEVICE_TYPES = QCC_DEVICE_TYPES | {"mock", "chardev"}
 
 #: Per-request one-shot read ceiling by device type (bytes). Larger
-#: requests fall back to a temporary continuous-mode burst.
+#: requests fall back to a temporary continuous-mode burst. ``chardev``
+#: deliberately has no entry: DMA reads are effectively unbounded.
 ONE_SHOT_LIMITS = {"firefly": 35_200, "dragonfly": 35_200, "qcicada": 13_440}
 
 
@@ -98,7 +102,7 @@ class DeviceConfig:
     """One QRNG device (or a loudly-labelled mock)."""
 
     id: str
-    type: str  # firefly | qcicada | dragonfly | mock
+    type: str  # firefly | qcicada | dragonfly | chardev | mock
     path: str = ""  # serial device path; unused for mock
     baud_rate: int = 115_200
     timeout: float = 5.0
@@ -107,6 +111,7 @@ class DeviceConfig:
     streaming_idle_timeout: float = 0.0  # minutes idle before sleeping (0 = never)
     rate_mbit_s: float | None = None  # informational (capacity notes)
     post_processing: str | None = None  # per-device override of the global mode
+    pci_address: str | None = None  # chardev only; enables freshness flush + health
 
 
 @dataclass
@@ -235,6 +240,7 @@ class Config:
                     "streaming_idle_timeout",
                     "rate_mbit_s",
                     "post_processing",
+                    "pci_address",
                 },
             )
             if "id" not in dev or "type" not in dev:
@@ -255,6 +261,16 @@ class Config:
                     f"devices[{dev['id']}]: post_processing must be one of "
                     f"{sorted(POST_PROCESSING_MODES)}, got {override!r}"
                 )
+            if dev.get("pci_address") is not None and dev["type"] != "chardev":
+                raise ConfigError(
+                    f"devices[{dev['id']}]: `pci_address` is only valid for type "
+                    f"'chardev', got type {dev['type']!r}"
+                )
+            if dev["type"] == "chardev" and override is not None:
+                raise ConfigError(
+                    f"devices[{dev['id']}]: `post_processing` does not apply to "
+                    "'chardev' devices — they serve whatever the driver DMA delivers"
+                )
             devices.append(
                 DeviceConfig(
                     id=str(dev["id"]),
@@ -269,6 +285,9 @@ class Config:
                         float(dev["rate_mbit_s"]) if dev.get("rate_mbit_s") is not None else None
                     ),
                     post_processing=override,
+                    pci_address=(
+                        str(dev["pci_address"]) if dev.get("pci_address") is not None else None
+                    ),
                 )
             )
 

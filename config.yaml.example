@@ -55,8 +55,9 @@ freshness:
   allow_pregeneration: false
 
 # ── Devices ──────────────────────────────────────────────────────────────────
-# Types: firefly (PCIe), qcicada (USB), dragonfly (high-rate serial) — all
-# driven via pyqcc — and mock (os.urandom; NOT quantum; dev/testing only).
+# Types: firefly (PCIe serial), qcicada (USB), dragonfly (high-rate serial) —
+# all driven via pyqcc — chardev (PCIe Dragonfly as a plain character device,
+# see below) and mock (os.urandom; NOT quantum; dev/testing only).
 devices:
   - id: "firefly-1"
     type: "firefly"
@@ -70,5 +71,31 @@ devices:
   #   path: "/dev/ttyQRNG0"
   #   streaming_mode: true
   #   rate_mbit_s: 350            # informational (capacity notes)
+  #
+  # PCIe Dragonfly character device (/dev/qrngDF*). No pyqcc, no qcc-cli
+  # post-processing chain — the server serves whatever the driver DMA
+  # delivers (`post_processing` is rejected on this type). Reads are
+  # blocking DMA transfers with no one-shot size limit.
+  #
+  # `pci_address` (optional but strongly recommended) enables, via sysfs
+  # /sys/bus/pci/devices/<addr>/:
+  #   - freshness flush: before EVERY measurement, `ready_count` (32-bit
+  #     words) is read and ready_count*4 buffered bytes are drained, so no
+  #     byte generated before the request is served;
+  #   - health snapshot: `error_present` + `error_bits` are read once per
+  #     measurement. WARNING: `error_bits` is CLEAR-ON-READ — Qbert0G must
+  #     be the ONLY process reading it on this box, or error flags are
+  #     silently swallowed by the other reader.
+  # Without `pci_address`, freshness flush is unavailable for the device
+  # (a one-time warning is logged).
+  # - id: "dragonfly-0"
+  #   type: "chardev"
+  #   path: "/dev/qrngDF0"
+  #   pci_address: "0000:09:00.0"
+  # - id: "dragonfly-1"
+  #   type: "chardev"
+  #   path: "/dev/qrngDF1"
+  #   pci_address: "0000:0a:00.0"
+  #
   # - id: "mock-0"                # development only — loudly logged, NOT quantum
   #   type: "mock"

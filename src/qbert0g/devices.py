@@ -6,6 +6,12 @@ Drives Crypta Labs devices through the official pyqcc library:
 - ``qcicada``   (USB,  ``/dev/ttyUSB*``) — one-shot limit 13,440 bytes
 - ``dragonfly`` (serial, ``/dev/ttyQRNG*``) — qcc protocol, high-rate
   (~350 Mbit/s); one-shot limit as firefly, best used in streaming mode
+- ``chardev``   (PCIe Dragonfly, ``/dev/qrngDF*``) — plain character
+  device, DMA reads, no pyqcc and no qcc-cli post-processing chain:
+  the server serves whatever the driver DMA delivers. With
+  ``pci_address`` configured, freshness flush drains the card FIFO
+  (sysfs ``ready_count``) and a health snapshot (``error_present`` /
+  ``error_bits``) is taken before every measurement.
 - ``mock``      — ``os.urandom``, NO hardware, NOT quantum; for
   development and tests only (logged loudly at startup)
 
@@ -34,6 +40,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 try:
@@ -46,14 +53,19 @@ except ImportError:
 
 import contextlib
 
-from .config import ONE_SHOT_LIMITS, Config, DeviceConfig
+from .config import ONE_SHOT_LIMITS, QCC_DEVICE_TYPES, Config, DeviceConfig
 
 logger = logging.getLogger(__name__)
 
 QCC_CLI = "/opt/firefly/qcc-cli"
 
-#: One-shot ceiling for the mock device (effectively unlimited).
-_MOCK_ONESHOT_LIMIT = 1 << 30
+#: sysfs directory holding per-card attribute files (``ready_count``,
+#: ``error_present``, ``error_bits``). Module-level so tests can point
+#: it at a tmp_path fixture — no hardware in CI.
+_SYSFS_PCI_ROOT = "/sys/bus/pci/devices"
+
+#: One-shot ceiling for devices without a hardware limit (mock, chardev).
+_UNBOUNDED_ONESHOT_LIMIT = 1 << 30
 
 
 class MockDevice:
@@ -84,6 +96,70 @@ class MockDevice:
         self._continuous = False
 
 
+class ChardevDevice:
+    """PCIe Dragonfly exposed as a plain character device (``/dev/qrngDF*``).
+
+    Exposes the same driver surface as :class:`MockDevice` so the
+    manager's routing/locking/failover paths need no special cases.
+    Reads are blocking DMA transfers: one ``os.read`` where possible,
+    looping only on short reads. There is no qcc-cli ``-P`` chain and no
+    pyqcc — post-processing is not applicable; the server serves
+    whatever the driver DMA delivers.
+    """
+
+    def __init__(self, path: str) -> None:
+        self._path = path
+        # O_BINARY is a no-op outside Windows; on Windows (tests only)
+        # it prevents newline translation corrupting byte counts.
+        self._fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+
+    def _read_exact(self, num_bytes: int) -> bytes:
+        chunks: list[bytes] = []
+        remaining = num_bytes
+        while remaining:
+            chunk = os.read(self._fd, remaining)
+            if not chunk:
+                raise RuntimeError(
+                    f"Char device {self._path} returned EOF after "
+                    f"{num_bytes - remaining}/{num_bytes} bytes"
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def drain(self, num_bytes: int) -> int:
+        """Read and discard up to *num_bytes*; returns bytes drained.
+
+        Freshness flush: discards everything the card generated before
+        this request. EOF-tolerant — a race with the FIFO refilling can
+        only leave FEWER stale bytes than ``ready_count`` reported.
+        """
+        remaining = num_bytes
+        while remaining:
+            chunk = os.read(self._fd, remaining)
+            if not chunk:
+                break
+            remaining -= len(chunk)
+        return num_bytes - remaining
+
+    # ── pyqcc-style driver surface ─────────────────────────────────────
+
+    def start_one_shot(self, num_bytes: int) -> bytes:
+        return self._read_exact(num_bytes)
+
+    def start_continuous(self) -> bool:
+        return True  # the card streams continuously by nature
+
+    def read_continuous(self, num_bytes: int) -> bytes:
+        return self._read_exact(num_bytes)
+
+    def stop(self) -> None:
+        pass  # nothing to stop; DMA reads are on-demand
+
+    def close_comm(self) -> None:
+        os.close(self._fd)
+
+
 class DeviceStatus(Enum):
     OFFLINE = "offline"
     ONLINE = "online"
@@ -104,6 +180,11 @@ class DeviceState:
     last_request_time: float | None = None
     error_message: str | None = None
     streaming_active: bool = False
+    # chardev pre-measurement snapshot (latest measurement; provenance in S10):
+    last_flushed_bytes: int | None = None  # freshness drain size, ready_count * 4
+    last_error_present: str | None = None  # sysfs error_present (raw text)
+    last_error_bits: str | None = None  # sysfs error_bits (raw text; clear-on-read)
+    flush_warning_emitted: bool = False  # one-time "no pci_address" warning latch
 
     @property
     def is_available(self) -> bool:
@@ -111,7 +192,7 @@ class DeviceState:
 
     @property
     def oneshot_limit(self) -> int:
-        return ONE_SHOT_LIMITS.get(self.config.type, _MOCK_ONESHOT_LIMIT)
+        return ONE_SHOT_LIMITS.get(self.config.type, _UNBOUNDED_ONESHOT_LIMIT)
 
 
 class DeviceManager:
@@ -139,7 +220,7 @@ class DeviceManager:
             if not dev_config.enabled:
                 logger.info("Device %s is disabled, skipping", dev_config.id)
                 continue
-            if dev_config.type != "mock" and not PYQCC_AVAILABLE:
+            if dev_config.type in QCC_DEVICE_TYPES and not PYQCC_AVAILABLE:
                 logger.error(
                     "pyqcc not available — cannot drive %s (%s). "
                     "Install the pyqcc wheel from Crypta Labs.",
@@ -210,17 +291,53 @@ class DeviceManager:
     # ── connection ─────────────────────────────────────────────────────
 
     def _flush_input(self, state: DeviceState) -> None:
-        """Clear the serial RX buffer so no pre-request byte is served.
+        """The single pre-measurement freshness seam.
 
-        pyqcc's ``comm.flush()`` only flushes the write side; we reach
-        the underlying pyserial object directly. Best-effort across
-        pyqcc versions; a no-op for mock devices. Gated on
+        Serial (pyqcc) devices: clear the RX buffer so no pre-request
+        byte is served. pyqcc's ``comm.flush()`` only flushes the write
+        side; we reach the underlying pyserial object directly
+        (best-effort across pyqcc versions). Chardev devices: drain the
+        card FIFO and take a health snapshot (:meth:`_chardev_pre_measurement`).
+        No-op for mock devices. The drain/flush half is gated on
         ``freshness.flush_device_buffer``.
         """
+        if isinstance(state.driver, ChardevDevice):
+            self._chardev_pre_measurement(state)
+            return
         if not self._flush_enabled or isinstance(state.driver, MockDevice):
             return
         with contextlib.suppress(Exception):
             state.driver._comm._ser.reset_input_buffer()
+
+    def _chardev_pre_measurement(self, state: DeviceState) -> None:
+        """Freshness translation + health snapshot for one chardev read.
+
+        With ``pci_address`` set: read sysfs ``ready_count`` (32-bit
+        words) and drain ``ready_count * 4`` bytes from the device node
+        so no byte generated before this request is served; then read
+        ``error_present`` / ``error_bits`` once. ``error_bits`` is
+        clear-on-read — Qbert0G must be the ONLY reader on the box.
+        Failures raise: serving possibly-stale bytes silently would
+        break the freshness contract (fail loud, let failover route).
+        """
+        pci_address = state.config.pci_address
+        if pci_address is None:
+            if self._flush_enabled and not state.flush_warning_emitted:
+                state.flush_warning_emitted = True
+                logger.warning(
+                    "Device %s: chardev without `pci_address` — freshness flush "
+                    "is unavailable; served bytes may predate the request",
+                    state.config.id,
+                )
+            return
+
+        sysfs_dir = Path(_SYSFS_PCI_ROOT) / pci_address
+        if self._flush_enabled:
+            ready_words = int((sysfs_dir / "ready_count").read_text().strip())
+            state.last_flushed_bytes = state.driver.drain(ready_words * 4)
+        # Health snapshot, once per measurement (S10 attaches it to provenance).
+        state.last_error_present = (sysfs_dir / "error_present").read_text().strip()
+        state.last_error_bits = (sysfs_dir / "error_bits").read_text().strip()
 
     async def _connect_device(self, device_id: str) -> None:
         """(Re)connect one device: set post-processing mode, open the port."""
@@ -242,6 +359,23 @@ class DeviceManager:
             state.status = DeviceStatus.ONLINE
             state.error_message = None
             logger.info("Device %s (mock) ready", device_id)
+            return
+
+        if config.type == "chardev":
+            # No qcc-cli -P chain, no pyqcc: the char device serves whatever
+            # the driver DMA delivers (post_processing is not applicable).
+            def _open_chardev() -> ChardevDevice:
+                return ChardevDevice(config.path)
+
+            try:
+                state.driver = await loop.run_in_executor(self._executor, _open_chardev)
+            except Exception as exc:
+                state.status = DeviceStatus.ERROR
+                state.error_message = str(exc)
+                raise RuntimeError(f"Failed to initialize device {device_id}: {exc}") from exc
+            state.status = DeviceStatus.ONLINE
+            state.error_message = None
+            logger.info("Device %s (chardev %s) ready", device_id, config.path)
             return
 
         qcc_mode = self._config.qcc_mode_for(config)
@@ -470,7 +604,11 @@ class DeviceManager:
             "type": state.config.type,
             "path": state.config.path,
             "status": state.status.value,
-            "post_processing": state.config.post_processing or self._config.post_processing_mode,
+            "post_processing": (
+                None  # not applicable: chardev serves whatever the driver DMA delivers
+                if state.config.type == "chardev"
+                else state.config.post_processing or self._config.post_processing_mode
+            ),
             "streaming_mode": state.config.streaming_mode,
             "streaming_active": state.streaming_active,
             "bytes_served": state.bytes_served,
@@ -478,6 +616,11 @@ class DeviceManager:
             "last_request_time": state.last_request_time,
             "error_message": state.error_message,
             "is_available": state.is_available,
+            # chardev health/freshness snapshot (None for other types):
+            "pci_address": state.config.pci_address,
+            "last_flushed_bytes": state.last_flushed_bytes,
+            "error_present": state.last_error_present,
+            "error_bits": state.last_error_bits,
         }
 
     def get_all_devices_status(self) -> list[dict]:

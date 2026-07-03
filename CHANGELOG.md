@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`chardev` device type** — PCIe Dragonfly cards exposed as plain
+  character devices (`/dev/qrngDF*`). No pyqcc, no qcc-cli `-P` chain:
+  the server serves whatever the driver DMA delivers (`post_processing`
+  is rejected on this type), with no one-shot size limit. Optional
+  `pci_address` on the device entry enables, via sysfs:
+  - **freshness translation** of the serial flush contract: before every
+    measurement, `ready_count` (32-bit words) is read and
+    `ready_count * 4` buffered bytes are drained (tracked per measurement
+    as `last_flushed_bytes` for provenance); without `pci_address` a
+    one-time warning marks the device as flush-unavailable;
+  - **health snapshot** per measurement: `error_present` / `error_bits`
+    (clear-on-read — Qbert0G must be the only reader on the box), exposed
+    through `get_device_status`.
+
 ## 1.0.0 — 2026-07-03
 
 Breaking upgrade: Qbert0G becomes an installable package that natively serves
