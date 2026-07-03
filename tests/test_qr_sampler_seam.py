@@ -90,6 +90,50 @@ class TestDefaultMethodPaths:
             await _call(source.close)
 
 
+class TestProfileBackedSource:
+    """qr-sampler drawing from a PROFILE id (S10): the new SourceRouter
+    path must uphold the same seam invariants as plain devices —
+    sequence_id echo (=> echo_verified) and never-empty data."""
+
+    async def _profile_key(self, profile_server, source_id: str) -> str:
+        raw_key, _ = await profile_server.db.create_api_key(
+            name=f"seam-{source_id}", primary_device_id=source_id
+        )
+        return raw_key
+
+    async def test_unary_fetch_from_xnor_profile(self, profile_server, profile_address):
+        key = await self._profile_key(profile_server, "qq-mock")
+        source = QuantumGrpcSource(
+            QRSamplerConfig(
+                grpc_server_address=profile_address, grpc_api_key=key, fallback_mode="error"
+            )
+        )
+        try:
+            data = await _call(source.get_random_bytes, 256)
+            assert len(data) == 256  # non-empty data through the profile path
+        finally:
+            await _call(source.close)
+
+    async def test_pipelined_prefetch_echo_verified_via_profile(
+        self, profile_server, profile_address
+    ):
+        key = await self._profile_key(profile_server, "pp-match")
+        source = QuantumGrpcSource(
+            QRSamplerConfig(
+                grpc_server_address=profile_address, grpc_api_key=key, fallback_mode="error"
+            )
+        )
+        try:
+            await _call(source.warmup)
+            ticket = await _call(source.prefetch, 64, 0x0123456789ABCDEF)
+            assert ticket is not None
+            data = await _call(source.get_random_bytes_with_ticket, 64, ticket)
+            assert len(data) == 64
+            assert ticket.echo_verified is True  # nonce echo survives the router
+        finally:
+            await _call(source.close)
+
+
 class TestLegacyMethodPath:
     """The public QuantumRNG protocol still serves qr-sampler's generic
     unary client (documented field collision: sequence_id slot carries
