@@ -1,199 +1,139 @@
 # Qbert0G
 
-A gRPC service that streams **freshly measured quantum noise** from Crypta Labs QRNG devices (Firefly and QCicada). This is built for entropy research.
+A gRPC service that streams **freshly measured quantum noise** from Crypta Labs QRNG devices (Firefly, QCicada, Dragonfly). Built for entropy research.
 
 > **Not for cryptographic or security use.**
 > Although Crypta Labs devices support cryptographic use cases, the output of this particular service isn't intended for such. If you need a cryptographic RNG service, look elsewhere.
 
 ## Features
 
-- **Fresh and exclusive data per request** — no pooling, buffering, or pre-gen; every byte is measured upon request and served exclusively to the requester
-- **Low latency and efficient on the wire** — gRPC over HTTP/2 with compact Protobuf framing minimizes both per-call latency and bytes-per-byte overhead
-- **Per-request provenance** — response includes `device_id` and `timestamp` so samples can be attributed and reproduced in datasets
-- **Multiple post-processing modes** — raw noise (zero post-processing), with noise conditioning, or SHA-256 post-processed. Selectable per device, for research needs
-- **Device failover** — automatic fallback across configured devices
-- **API key management** — per-key rate limits, daily byte caps, and per-request byte caps, with usage tracked in SQLite
-
-Each response carries raw bytes sampled at request time, tagged with the source `device_id` and a microsecond `timestamp`, so every byte is traceable to a specific device and measurement window.
+- **Fresh and exclusive data per request** — no pooling, buffering, or pre-generation; every byte is measured upon request and served exclusively to the requester. When `freshness.flush_device_buffer` is on (the default), the serial receive buffer is flushed immediately before **every** measurement, so no byte measured before the request is ever served.
+- **Two wire protocols on one server** — the public `qrng.QuantumRNG` service for general clients, plus the `qr_entropy.EntropyService` protocol consumed natively by [qr-sampler](https://github.com/Entropic-Science) (sequence-id echo, nanosecond generation timestamps, bidirectional streaming).
+- **Low latency and efficient on the wire** — gRPC over HTTP/2; optional UNIX-domain-socket binding for co-located clients.
+- **Per-request provenance** — responses carry `device_id` and a measurement timestamp so samples can be attributed and reproduced in datasets.
+- **Selectable post-processing** — `raw` (zero post-processing), `sha256`, or `raw_samples`, globally or per device.
+- **Device failover** — automatic fallback across configured devices.
+- **API key management** — per-key rate limits, daily byte caps, and per-request byte caps, tracked in SQLite; managed via `qbert0g keys`.
+- **Mock device type** — run the full server without hardware (`os.urandom`, loudly labelled NOT quantum) for development and CI.
 
 ## Architecture
 
-```
-Client (Python/Go/Java/etc.)
-    ↓ gRPC (HTTP/2 + Protobuf)
-gRPC Server (port 50051)
-    ↓
-Device Manager (thread-safe)
-    ↓
-Quantum Devices (Firefly/QCicada)
+```mermaid
+flowchart TD
+    A["General clients<br/>(any language)"] -- "qrng.QuantumRNG/GetRandomBytes" --> S["gRPC server<br/>(TCP and/or UNIX socket)"]
+    B["qr-sampler / qthought<br/>(QuantumGrpcSource)"] -- "qr_entropy.EntropyService<br/>GetEntropy + StreamEntropy" --> S
+    S --> G["RequestGate<br/>(auth, rate limits, byte caps, usage)"]
+    G --> D["DeviceManager<br/>(locking, failover, freshness flush)"]
+    D --> Q1["Firefly / QCicada / Dragonfly<br/>(pyqcc)"]
+    D --> Q2["mock (os.urandom, dev only)"]
+    G --> DB[("SQLite<br/>API keys + usage")]
 ```
 
-## Quick Start
+Both services share one request pipeline: auth, rate limiting, byte caps, device routing and usage accounting are identical regardless of which protocol a client speaks.
 
-### 1. Installation
+## Quick start
 
 ```bash
-cd /your/directory/qrng-grpc
+git clone https://github.com/Entropic-Science/Qbert0G
+cd Qbert0G
+pip install .
 
-# Install dependencies
-pip install -r requirements.txt
+# Hardware devices additionally need pyqcc (wheel from Crypta Labs):
+# pip install /path/to/pyqcc-x.y.z-py3-none-any.whl
 
-# Install pyqcc (obtain wheel from Crypta Labs)
-pip install /path/to/pyqcc-x.y.z-py3-none-any.whl
-```
-
-### 2. Generate Protobuf Code
-
-```bash
-make proto
-```
-
-This creates:
-- `proto/qrng_pb2.py` - Message classes
-- `proto/qrng_pb2_grpc.py` - Service stubs
-
-### 3. Configuration
-
-```bash
-# Copy example config
 cp config.yaml.example config.yaml
+#   edit config.yaml: set auth.api_key, configure devices
 
-# Edit config.yaml
-# - Set admin_api_key for bootstrap admin
-# - Configure your devices (paths, types, modes)
-# - Adjust service settings (port, limits, etc.)
+qbert0g check-config          # validate before starting
+qbert0g serve                 # run the server
 ```
 
-### 4. Run the Service
+Config resolution everywhere: `--config PATH` > `QBERT0G_CONFIG` env var > `./config.yaml`. A missing config file is an error — the daemon never starts on silent defaults.
 
-```bash
-python run.py
+To try it without hardware, configure a mock device:
+
+```yaml
+devices:
+  - id: "mock-0"
+    type: "mock"     # os.urandom — NOT quantum; development only
 ```
 
-The server will:
-1. Initialize the database (`qrng_grpc.db`)
-2. Connect to configured QRNG devices
-3. Start listening on port 50051
+## The two protocols
 
-## API
+### `qrng.QuantumRNG` — the public service
 
-### Protocol Buffer Definition
+**Request (`RandomRequest`):** `num_bytes` (uint32). API key via gRPC metadata (default header `api-key`).
 
-See [proto/qrng.proto](proto/qrng.proto) for the complete definition.
-
-**Request (`RandomRequest`):**
-- `num_bytes` (`uint32`): Number of raw bytes to return
-- API key: passed via gRPC metadata key `api-key` (not in the message body)
-
-**Response (`RandomResponse`):**
-- `data` (`bytes`): Raw quantum random bytes
-- `timestamp` (`uint64`): Server timestamp (Unix epoch, microseconds)
-- `device_id` (`string`): Device that served the request
-
-### Python Client Example
+**Response (`RandomResponse`):** `data` (bytes), `timestamp` (uint64, epoch **microseconds**, stamped at measurement time), `device_id` (string).
 
 ```python
 import grpc
-from proto import qrng_pb2, qrng_pb2_grpc
+from qbert0g.proto import qrng_pb2, qrng_pb2_grpc
 
-channel = grpc.insecure_channel('localhost:50051')
+channel = grpc.insecure_channel("localhost:50051")
 stub = qrng_pb2_grpc.QuantumRNGStub(channel)
-
-request = qrng_pb2.RandomRequest(num_bytes=100)
-metadata = [("api-key", "your-api-key-here")]
-
-try:
-    response = stub.GetRandomBytes(request, metadata=metadata)
-
-    print(f"Received {len(response.data)} bytes")
-    print(f"From device: {response.device_id}")
-    print(f"Timestamp: {response.timestamp}")
-
-    # Interpret raw bytes as needed on the client side:
-    import struct
-    uint8_array  = list(response.data)
-    uint16_array = [struct.unpack('<H', response.data[i:i+2])[0]
-                    for i in range(0, len(response.data), 2)]
-
-except grpc.RpcError as e:
-    print(f"Error: {e.code()} - {e.details()}")
+response = stub.GetRandomBytes(
+    qrng_pb2.RandomRequest(num_bytes=100),
+    metadata=[("api-key", "your-api-key-here")],
+)
+print(len(response.data), response.device_id, response.timestamp)
 ```
 
-### grpcurl Example
+Or with grpcurl:
 
 ```bash
 grpcurl -plaintext \
-  -proto proto/qrng.proto \
+  -proto src/qbert0g/proto/qrng.proto \
   -H 'api-key: YOUR_API_KEY' \
   -d '{"num_bytes": 1024}' \
   localhost:50051 qrng.QuantumRNG/GetRandomBytes
 ```
 
-## API Key Management
+### `qr_entropy.EntropyService` — the qr-sampler seam
 
-### Bootstrap Admin Key (via config.yaml)
+**Request (`EntropyRequest`):** `bytes_needed` (int32), `sequence_id` (int64 — qr-sampler sends a 63-bit commitment nonce here on its pipelined path).
 
-Set `admin_api_key` in `config.yaml` before first startup:
+**Response (`EntropyResponse`):** `data`, `sequence_id` (echoed verbatim — this is what lets qr-sampler verify post-selection ordering, `echo_verified`), `generation_timestamp_ns` (epoch nanoseconds at measurement), `device_id`.
 
-```yaml
-admin_api_key: "sample-only-your-secure-bootstrap-key"
+RPCs: `GetEntropy` (unary) and `StreamEntropy` (bidirectional stream — one response per in-stream request, each passing the full auth/limits gate). The bidi RPC is what unlocks qr-sampler's lowest-latency `bidi_streaming` mode.
+
+A qr-sampler client needs **zero protocol configuration** — its defaults (`/qr_entropy.EntropyService/GetEntropy` + `StreamEntropy`) resolve against this server directly:
+
+```python
+from qr_sampler.contract import QRSamplerConfig
+from qr_sampler.entropy.qgrpc.source import QuantumGrpcSource
+
+source = QuantumGrpcSource(QRSamplerConfig(
+    grpc_server_address="127.0.0.1:50051",
+    grpc_api_key="your-api-key-here",
+))
+data = source.get_random_bytes(10_000)
 ```
 
-On first startup this creates an admin key in the database. If you change the value and restart, the new key is added as a second admin — the old one is not removed. To revoke the old key use `manage_keys.py disable` or `delete` (see below).
+See `examples/client.py` for a runnable demo of both protocols, and `tests/test_qr_sampler_seam.py` for the full cross-repo contract (echo verification, bidi streaming, legacy path).
 
-### Managing Keys with manage_keys.py
+## API key management
 
-Use the included CLI tool to manage keys. Must be run from the project directory.
+The bootstrap admin key comes from `auth.api_key` in `config.yaml`: on first startup an enabled admin key (device `*`) is created for it. Changing the value later **adds** a second admin; revoke old keys explicitly.
 
-**List all keys:**
+All key management goes through the CLI (run on the server box; `--config` locates the database):
+
 ```bash
-python manage_keys.py list
+qbert0g keys list
+qbert0g keys create --name "my-client" --device firefly-1
+qbert0g keys create --name "high-volume" --device dragonfly-0 \
+    --rate-limit 500 --daily-bytes 524288000 --max-bytes 65536
+qbert0g keys create --name "ops-admin" --device "*" --admin
+qbert0g keys update --id <key-id> --rate-limit 100
+qbert0g keys disable --id <key-id>
+qbert0g keys enable  --id <key-id>
+qbert0g keys usage   --id <key-id> --days 30
+qbert0g keys delete  --id <key-id>          # add --yes to skip the prompt
 ```
 
-**Create a user key:**
-```bash
-python manage_keys.py create --name "my-client" --device firefly-1
-```
-The raw key is printed once at creation and cannot be retrieved again. All key details (ID, name, device, limits) are also printed.
+The raw key is printed once at creation and cannot be retrieved again (only its SHA-256 hash is stored).
 
-**Create with custom limits:**
-```bash
-python manage_keys.py create --name "high-volume" --device firefly-1 \
-  --rate-limit 500 --daily-bytes 524288000 --max-bytes 65536
-```
-
-**Create an admin key:**
-```bash
-python manage_keys.py create --name "ops-admin" --device "*" --admin
-```
-
-**Update limits on an existing key:**
-```bash
-python manage_keys.py update --id <key-id> --rate-limit 100
-python manage_keys.py update --id <key-id> --max-bytes 4096 --daily-bytes 10485760
-python manage_keys.py update --id <key-id> --device firefly-2
-```
-
-**Disable / re-enable a key:**
-```bash
-python manage_keys.py disable --id <key-id>
-python manage_keys.py enable --id <key-id>
-```
-
-**View usage stats:**
-```bash
-python manage_keys.py usage --id <key-id>
-python manage_keys.py usage --id <key-id> --days 30
-```
-
-**Delete a key** (prompts for confirmation):
-```bash
-python manage_keys.py delete --id <key-id>
-```
-
-**Available device IDs** for `--device`: `firefly-1`, `firefly-2`, or `*` (any available device).
-
-**Per-key limits** (all optional; omit to use the service-wide config default):
+**Per-key limits** (omit to use the service-wide default from `limits:`):
 
 | Flag | Description |
 |------|-------------|
@@ -203,152 +143,88 @@ python manage_keys.py delete --id <key-id>
 
 ## Configuration
 
-### Service Settings
+See `config.yaml.example` for the full annotated schema. Highlights:
 
 ```yaml
-service:
-  host: "0.0.0.0"
-  port: 50051                      # gRPC port
-  request_timeout: 5.0             # Device wait timeout
-  max_bytes_per_request: 16384     # Default max bytes per request (overridable per key)
-  database_path: "./qrng_grpc.db"
-  failover_enabled: true           # Device failover
-  default_rate_limit: 200          # Requests/minute
-  default_daily_byte_limit: 104857600  # 100 MB/day
-  max_message_size: 16777216       # 16 MB max
-```
-
-### Device Configuration
-
-```yaml
+server:
+  listen: "127.0.0.1:50051"    # TCP bind; 0.0.0.0 exposes entropy off-box (warned)
+  unix_socket: ""              # preferred transport for co-located clients
+  request_timeout: 5.0
+  failover_enabled: true
+database:
+  path: "./qbert0g.db"
+auth:
+  api_key: "..."               # bootstrap admin key
+  header: "api-key"
+limits:
+  max_bytes_per_request: 16384
+  max_bytes_per_day: 104857600
+  rate_limit_per_minute: 200
+post_processing:
+  mode: raw                    # raw | sha256 | raw_samples
+freshness:
+  flush_device_buffer: true    # flush serial RX buffer before EVERY read
+  emit_generation_timestamp: true
+  allow_pooling: false         # declarative guard — true is refused
+  allow_pregeneration: false
 devices:
-  - id: "firefly-1"
-    type: "firefly"
-    path: "/dev/ttyACM0"
-    enabled: true
-    post_processing_mode: 1  # 0=SHA256, 1=raw noise, 2=raw samples
+  - id: "dragonfly-0"
+    type: "dragonfly"          # firefly | qcicada | dragonfly | mock
+    path: "/dev/ttyQRNG0"
+    streaming_mode: true
 ```
 
-## Error Handling
+Validation is strict: **unknown keys are rejected at startup**, so a typo can never silently change what kind of randomness is served.
 
-gRPC errors are returned as standard status codes:
+## Error handling
 
 | gRPC Status | Reason |
 |-------------|--------|
 | `UNAUTHENTICATED` | Missing or invalid API key |
 | `RESOURCE_EXHAUSTED` | Rate limit or daily byte limit exceeded |
-| `INVALID_ARGUMENT` | `num_bytes` is 0 or exceeds per-request limit |
+| `INVALID_ARGUMENT` | Byte count is 0 or exceeds the per-request limit |
 | `UNAVAILABLE` | No devices available or device error |
-| `DEADLINE_EXCEEDED` | Request timed out waiting for device |
-
-## Monitoring
-
-### Logs
-
-The service logs to stdout:
-```
-2026-01-15 10:30:00 - app.server - INFO - Starting gRPC server on 0.0.0.0:50051
-2026-01-15 10:30:01 - app.device_manager - INFO - Device firefly-1 connected successfully
-```
-
-### Usage Statistics
-
-Query the database directly:
-```sql
--- Today's usage
-SELECT key_id, requests, bytes_served
-FROM usage_records
-WHERE date = '2024-01-15';
-
--- Top users
-SELECT k.name, SUM(u.bytes_served) as total_bytes
-FROM api_keys k
-JOIN usage_records u ON k.id = u.key_id
-GROUP BY k.id
-ORDER BY total_bytes DESC;
-```
+| `DEADLINE_EXCEEDED` | Request timed out waiting for a device |
 
 ## Development
 
-### Project Structure
-
-```
-qrng-grpc/
-├── proto/
-│   ├── qrng.proto          # Protocol buffer definition
-│   ├── qrng_pb2.py         # Generated (don't edit)
-│   └── qrng_pb2_grpc.py    # Generated (don't edit)
-├── app/
-│   ├── __init__.py
-│   ├── config.py           # Configuration management
-│   ├── database.py         # API keys & usage tracking
-│   ├── device_manager.py   # Device communication
-│   └── server.py           # gRPC service implementation
-├── example_client.py       # Example client
-├── manage_keys.py          # API key management CLI
-├── run.py                  # Entry point
-├── config.yaml             # Configuration
-├── requirements.txt        # Dependencies
-└── README.md               # This file
-```
-
-### Regenerating Protobuf Code
-
-After modifying `proto/qrng.proto`:
-
 ```bash
-make proto
+pip install -e .[dev]
+make test          # pytest (46 tests; hardware not required — mock device)
+make check         # ruff + pytest
+make proto         # regenerate protobuf stubs after editing .proto files
+```
+
+The cross-repo seam tests (`tests/test_qr_sampler_seam.py`) run automatically when qr-sampler is importable (`pip install -e ../qr-sampler`) and skip otherwise.
+
+### Project structure
+
+```
+Qbert0G/
+├── src/qbert0g/
+│   ├── cli.py           # qbert0g serve | keys | check-config
+│   ├── config.py        # strict YAML schema (unknown keys rejected)
+│   ├── database.py      # API keys + usage tracking (SQLite, hashed keys)
+│   ├── devices.py       # DeviceManager: pyqcc drivers + mock, flush, failover
+│   ├── gate.py          # shared request pipeline (auth, limits, measure)
+│   ├── server.py        # both gRPC servicers + QbertServer lifecycle
+│   └── proto/           # qrng.proto + entropy_service.proto + generated stubs
+├── tests/               # config, database, devices, server, qr-sampler seam
+├── examples/client.py   # both protocols, runnable
+└── config.yaml.example  # annotated canonical config
 ```
 
 ## Troubleshooting
 
-### "No module named 'proto.qrng_pb2'"
-
-Generate the protobuf code:
-```bash
-make proto
-```
-
-### "pyqcc not available"
-
-Install pyqcc from the wheel file:
-```bash
-pip install /path/to/pyqcc-x.y.z-py3-none-any.whl
-```
-
-### Port 50051 already in use
-
-Change the port in `config.yaml`:
-```yaml
-service:
-  port: 50052  # Or any available port
-```
-
-### Device permission denied
-
-Add user to dialout group:
-```bash
-sudo usermod -a -G dialout $USER
-# Log out and back in
-```
+- **`Config error: ... unknown key(s)`** — your config uses the pre-1.0 schema (`service:`, `admin_api_key`, integer `post_processing_mode`). Migrate to the schema in `config.yaml.example`; see `CHANGELOG.md`.
+- **`pyqcc not available`** — install the wheel from Crypta Labs: `pip install /path/to/pyqcc-x.y.z-py3-none-any.whl`. Mock devices work without it.
+- **Port already in use** — change `server.listen` in `config.yaml`.
+- **Device permission denied** — add the service user to the `dialout` group.
 
 ## License
 
-Licensed under the Apache License, Version 2.0 (January 2004). See [LICENSE](LICENSE) for the full text.
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
 
 ```
 Copyright 2026 Entropic Science, Bradley Stephenson (orphiceye)
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
 ```
-
-## Support
-
-For issues or questions:
-1. Check device connections: `ls -l /dev/ttyACM* /dev/ttyUSB*`
-2. Review logs for error messages
-3. Verify config.yaml settings
