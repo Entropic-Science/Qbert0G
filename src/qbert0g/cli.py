@@ -225,6 +225,16 @@ def _cmd_check_config(args: argparse.Namespace) -> None:
             f"    - {dev.id} ({dev.type}, {dev.path or 'no path'}, "
             f"post_processing={mode}, {extra})"
         )
+    print(f"  controls:         {len(config.controls)}")
+    for ctl in config.controls:
+        detail = f", model={ctl.model}" if ctl.model else ""
+        print(f"    - {ctl.id} ({ctl.type}, seeded{detail}) -- PRNG, NOT quantum")
+    print(f"  profiles:         {len(config.profiles)}")
+    for prof in config.profiles:
+        params = ""
+        if prof.transform == "parity":
+            params = f", taps={list(prof.taps)}, stride={prof.stride}"
+        print(f"    - {prof.id} ({prof.transform} over {prof.inputs}{params})")
 
 
 def build_parser() -> argparse.ArgumentParser:

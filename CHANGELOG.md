@@ -4,6 +4,36 @@
 
 ### Added
 
+- **PRNG control sources and profile transforms (config + pure layer)** —
+  groundwork for serving experiment arms (QQ / QP / PP match streams,
+  parity extraction) as first-class source ids:
+  - `controls:` config section + `controls.py`: seeded PRNG sources,
+    loudly NOT quantum — `prng_uniform` (canonical stream = little-endian
+    bytes of successive PCG64 64-bit raw outputs; NOT `Generator.bytes()`,
+    whose per-call word truncation would make the stream depend on request
+    chunking) and `prng_markov` (order-1 byte Markov chain from an npz
+    model, one 64-bit draw per byte, `prev_byte` persistent across
+    requests within a server session). 128-bit hex seeds are REQUIRED (no
+    silent time-seeding); every control tracks `stream_offset_bytes` so
+    any served block is regenerable offline from
+    `(source_id, seed, stream_offset_bytes)`.
+  - `profiles:` config section + `profiles.py`: pure transform library —
+    `identity`, `xnor` (agreement: output bit = 1 where inputs agree) and
+    `parity` (tapped XOR decimation; consumption
+    `stride*(m-1) + max(taps) + 1` bits). Bit order is numpy
+    `unpackbits`/`packbits`, MSB first within each byte (pinned in tests).
+    Validation: one id namespace across devices + controls + profiles, no
+    profile nesting, per-transform arity, and a **period-4 guard**
+    (pairwise tap distances / strides that are multiples of 4 are
+    rejected unless `params.allow_period4: true` — known hardware
+    periodicity).
+  - `profiles_defaults:` config section (`chunk_bytes`, `max_skew_ns`)
+    for the paired-read serving path (SourceRouter, upcoming).
+  - `scripts/fit_markov.py`: fits the `prng_markov` npz model from raw
+    device dumps (Laplace +1 smoothing) and prints a model-vs-dump
+    statistical fingerprint (byte mean, per-bit P(1), lag-1 correlation).
+  - New runtime dependency: **numpy** (controls + parity transform).
+
 - **`chardev` device type** — PCIe Dragonfly cards exposed as plain
   character devices (`/dev/qrngDF*`). No pyqcc, no qcc-cli `-P` chain:
   the server serves whatever the driver DMA delivers (`post_processing`

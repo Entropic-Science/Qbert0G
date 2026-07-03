@@ -99,3 +99,57 @@ devices:
   #
   # - id: "mock-0"                # development only — loudly logged, NOT quantum
   #   type: "mock"
+
+# ── PRNG control sources ─────────────────────────────────────────────────────
+# Seeded pseudorandom sources — loudly NOT quantum. They exist as matched
+# statistical controls for the quantum devices in experiment arms. `seed`
+# is REQUIRED (128-bit hex: 0x + 32 digits; no silent time-seeding) so any
+# served block is regenerable offline from (id, seed, stream_offset_bytes).
+# NOTE: validated at startup; served ids become addressable once the
+# SourceRouter lands (see CHANGELOG, Unreleased).
+controls:
+  - id: "prng-uniform-0"
+    type: "prng_uniform"          # numpy PCG64 raw 64-bit output stream
+    seed: "0x9e3779b97f4a7c15f39cc0605cedc834"
+  # Order-1 byte Markov chain fitted to a specific quantum card's
+  # statistical fingerprint. Fit the npz model from raw dumps with
+  # scripts/fit_markov.py; the model file must exist and validate
+  # (row-stochastic within 1e-9) when the server starts.
+  # - id: "prng-markov-0"
+  #   type: "prng_markov"
+  #   model: "/etc/qthought/models/dragonfly-0_v17.npz"
+  #   seed: "0x243f6a8885a308d313198a2e03707344"
+
+# ── Profiles ─────────────────────────────────────────────────────────────────
+# Named deterministic transforms over devices/controls (never over other
+# profiles — no nesting). Devices, controls and profiles share ONE id
+# namespace; API keys bind to any of them. Transforms (bit order: numpy
+# unpackbits/packbits, MSB first within each byte):
+#   identity(a)         — passthrough (a profile id fronting a plain device)
+#   xnor(a, b)          — agreement: output bit = 1 where the inputs agree
+#   parity(a; params)   — output bit i = XOR of input bits stride*i + t, t in taps
+# Period-4 guard: a pairwise tap distance or a stride that is a multiple
+# of 4 is REJECTED unless `params.allow_period4: true` — the hardware has
+# a known period-4 periodicity, and same-phase taps would correlate with
+# it. The escape hatch exists on purpose: the canonical phase-covering
+# design below (taps hitting all four residues mod 4, stride 4) samples
+# one bit from each phase per output bit and must opt in explicitly.
+profiles:
+  - id: "raw-firefly"
+    transform: "identity"
+    inputs: ["firefly-1"]
+  # - id: "qq-match"              # agreement stream of two quantum cards
+  #   transform: "xnor"
+  #   inputs: ["dragonfly-0", "dragonfly-1"]
+  # - id: "qp-match"              # quantum vs fitted-PRNG control arm
+  #   transform: "xnor"
+  #   inputs: ["dragonfly-0", "prng-markov-0"]
+  # - id: "parity4-df0"
+  #   transform: "parity"
+  #   inputs: ["dragonfly-0"]
+  #   params: { taps: [0, 9, 19, 30], stride: 4, allow_period4: true }
+
+# Shared knobs for profile serving (paired reads).
+profiles_defaults:
+  chunk_bytes: 4096               # alternating paired-read chunk size
+  max_skew_ns: 50000000           # pair-skew WARNING threshold (50 ms)
