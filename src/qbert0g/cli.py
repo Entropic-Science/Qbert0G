@@ -4,9 +4,16 @@ Subcommands:
 
 - ``qbert0g serve [--config PATH]`` — run the gRPC server.
 - ``qbert0g keys <list|create|update|enable|disable|delete|usage> ...``
-  — manage API keys in the server's SQLite store.
+  — manage API keys in the server's SQLite store. Keys bind to ANY
+  source id: device, PRNG control, or profile.
 - ``qbert0g check-config [--config PATH]`` — validate the config file
   and print the resolved shape without starting anything.
+- ``qbert0g sources list`` — every source in the namespace (devices,
+  controls, profiles) with kind, transform, inputs and availability.
+- ``qbert0g profiles pull --id X --bytes N --out F`` — offline
+  generation through the EXACT SourceRouter serving path (no gRPC, no
+  gate), for feeding ent / PractRand; writes a provenance record with
+  ``protocol: "cli"``.
 
 Config resolution everywhere: ``--config`` > ``QBERT0G_CONFIG`` env >
 ``./config.yaml``.
@@ -18,6 +25,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from pathlib import Path
 
 from .config import Config, ConfigError
 from .database import Database
@@ -188,6 +196,55 @@ async def _run_keys(args: argparse.Namespace) -> None:
         await db.disconnect()
 
 
+# ── sources / profiles subcommands ───────────────────────────────────────
+
+
+async def _with_router(config: Config, fn) -> None:
+    """Run *fn(router)* against an initialized DeviceManager + SourceRouter.
+
+    The same construction path the server uses — CLI reads exercise the
+    exact serving code, only bypassing gRPC and the request gate.
+    """
+    from .devices import DeviceManager  # deferred: device stack is heavy
+    from .sources import SourceRouter
+
+    devices = DeviceManager(config)
+    await devices.initialize()
+    try:
+        await fn(SourceRouter(config, devices))
+    finally:
+        await devices.shutdown()
+
+
+async def _run_sources_list(args: argparse.Namespace) -> None:
+    config = Config.load(args.config)
+
+    async def _list(router) -> None:
+        rows = router.describe()
+        print(f"{'ID':<24}  {'KIND':<8}  {'TRANSFORM':<12}  {'INPUTS':<32}  AVAILABILITY")
+        print("-" * 100)
+        for row in rows:
+            print(
+                f"{row['id']:<24}  {row['kind']:<8}  {row['transform']:<12}  "
+                f"{row['inputs']:<32}  {row['availability']}"
+            )
+
+    await _with_router(config, _list)
+
+
+async def _run_profiles_pull(args: argparse.Namespace) -> None:
+    config = Config.load(args.config)
+
+    async def _pull(router) -> None:
+        read = await router.read(args.id, args.bytes)  # no timeout: operator tool
+        Path(args.out).write_bytes(read.data)
+        record = router.record_provenance(read, protocol="cli", served_bytes=args.bytes)
+        print(f"Wrote {len(read.data)} bytes from {read.source_id!r} to {args.out}")
+        print(f"Provenance record {record['request_id']} appended to {config.provenance.path}")
+
+    await _with_router(config, _pull)
+
+
 # ── top-level commands ───────────────────────────────────────────────────
 
 
@@ -261,7 +318,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_create = keys_sub.add_parser("create", help="Create a new API key")
     p_create.add_argument("--name", required=True, help="Descriptive name for the key")
     p_create.add_argument(
-        "--device", required=True, help="Primary device ID (or * for any available device)"
+        "--device",
+        required=True,
+        help="Primary source ID — a device, PRNG control, or profile "
+        "(or * for any available device)",
     )
     p_create.add_argument("--admin", action="store_true", help="Grant admin privileges")
     p_create.add_argument("--rate-limit", type=int, metavar="RPM", help="Requests per minute")
@@ -288,6 +348,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_usage.add_argument("--id", required=True, help="Key ID")
     p_usage.add_argument("--days", type=int, default=7, help="History window in days (default: 7)")
 
+    p_sources = sub.add_parser("sources", help="Inspect the source namespace")
+    p_sources.add_argument("--config", help="Path to config.yaml")
+    sources_sub = p_sources.add_subparsers(dest="sources_command", required=True)
+    sources_sub.add_parser(
+        "list", help="List all devices, controls and profiles with availability"
+    )
+
+    p_profiles = sub.add_parser("profiles", help="Offline profile operations")
+    p_profiles.add_argument("--config", help="Path to config.yaml")
+    profiles_sub = p_profiles.add_subparsers(dest="profiles_command", required=True)
+    p_pull = profiles_sub.add_parser(
+        "pull",
+        help="Generate bytes through the exact serving path (no gRPC) and write them to a file",
+    )
+    p_pull.add_argument("--id", required=True, help="Source ID (profile, control, or device)")
+    p_pull.add_argument("--bytes", required=True, type=int, help="Number of bytes to generate")
+    p_pull.add_argument("--out", required=True, help="Output file path")
+
     return parser
 
 
@@ -300,6 +378,10 @@ def main(argv: list[str] | None = None) -> None:
             _cmd_check_config(args)
         elif args.command == "keys":
             asyncio.run(_run_keys(args))
+        elif args.command == "sources":
+            asyncio.run(_run_sources_list(args))
+        elif args.command == "profiles":
+            asyncio.run(_run_profiles_pull(args))
     except ConfigError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
