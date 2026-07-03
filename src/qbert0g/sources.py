@@ -35,6 +35,7 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -64,6 +65,20 @@ class SourceRead:
     transform: str | None  # profile transform name; None for plain devices/controls
     inputs: list[dict]  # per-input provenance facts (JSON-ready)
     max_pair_skew_ns: int | None  # paired device reads only
+
+
+@dataclass(frozen=True)
+class WatchSample:
+    """One raw sample for the CLI bitstream viewer (``sources watch``).
+
+    Produced by :meth:`SourceRouter.watch_read` through the exact
+    paired/locked read choreography the serving path uses — the viewer
+    observes real serving behavior, not a parallel implementation.
+    """
+
+    chunks: list[bytes]  # one raw chunk per requested source id, in id order
+    capture_ns: list[int]  # monotonic-ns capture timestamp per chunk
+    skew_ns: int | None  # |t_A - t_B| for paired reads; None for single
 
 
 class ProvenanceLog:
@@ -144,6 +159,32 @@ class SourceRouter:
             return await self._read_control(source_id, num_bytes)
         return await self._read_device(source_id, num_bytes, timeout)
 
+    async def watch_read(self, ids: Sequence[str], num_bytes: int) -> WatchSample:
+        """One raw sample for the CLI bitstream viewer (``sources watch``).
+
+        Views RAW DEVICE streams only (the inputs feeding an xnor gate),
+        through the exact serving choreography: two ids take the paired
+        read path (lexicographic lock order, request-start flush,
+        per-chunk monotonic-ns timestamps); one id takes the locked
+        single-device profile-input path. No failover, no provenance —
+        this is an operator's eyeball tool, not a serving endpoint.
+        """
+        for source_id in ids:
+            if source_id not in self._devices.devices:
+                raise SourceUnavailableError(
+                    f"sources watch views raw device streams; {source_id!r} is not a device"
+                )
+        if len(ids) == 1:
+            data, fact, _epoch_ns = await self._device_input_read(ids[0], num_bytes)
+            return WatchSample(chunks=[data], capture_ns=[fact["first_chunk_ns"]], skew_ns=None)
+        if len(ids) == 2:
+            owner = f"watch({ids[0]},{ids[1]})"
+            raw, facts, _epoch_ns, skew = await self._paired_device_read(owner, ids, num_bytes)
+            return WatchSample(
+                chunks=raw, capture_ns=[f["first_chunk_ns"] for f in facts], skew_ns=skew
+            )
+        raise ValueError(f"sources watch takes one or two device ids, got {len(ids)}")
+
     # ── plain devices (delegation — behavior unchanged) ────────────────
 
     async def _read_device(
@@ -220,7 +261,9 @@ class SourceRouter:
                 )
 
         if len(device_inputs) == 2:
-            raw, facts, timestamp_ns, max_skew = await self._paired_device_read(profile, need)
+            raw, facts, timestamp_ns, max_skew = await self._paired_device_read(
+                profile.id, profile.inputs, need
+            )
         else:
             raw, facts, timestamp_ns = await self._sequential_read(profile, need)
             max_skew = None
@@ -283,10 +326,14 @@ class SourceRouter:
         return data, fact, epoch_ns
 
     async def _paired_device_read(
-        self, profile: Profile, need: int
+        self, owner_id: str, input_ids: Sequence[str], need: int
     ) -> tuple[list[bytes], list[dict], int, int]:
-        """Paired quantum-quantum read: locked, flushed once, chunk-alternated."""
-        a_id, b_id = profile.inputs
+        """Paired quantum-quantum read: locked, flushed once, chunk-alternated.
+
+        *owner_id* names the caller (profile id, or the watch viewer) in
+        errors and the skew WARNING; the choreography is identical.
+        """
+        a_id, b_id = input_ids
         first_id, second_id = sorted((a_id, b_id))  # lexicographic lock order (deadlock rule)
         dm = self._devices
         chunks: dict[str, list[bytes]] = {a_id: [], b_id: []}
@@ -314,16 +361,14 @@ class SourceRouter:
         except SourceUnavailableError:
             raise
         except Exception as exc:
-            raise SourceUnavailableError(
-                f"profile {profile.id!r}: paired read failed: {exc}"
-            ) from exc
+            raise SourceUnavailableError(f"{owner_id!r}: paired read failed: {exc}") from exc
 
         max_skew = max(abs(ta - tb) for ta, tb in zip(stamps[a_id], stamps[b_id], strict=True))
         if max_skew > self._max_skew_ns:
             logger.warning(
                 "Profile %s: pair skew %d ns exceeds max_skew_ns=%d — serving anyway; "
                 "the simultaneity bound is looser than intended",
-                profile.id,
+                owner_id,
                 max_skew,
                 self._max_skew_ns,
             )

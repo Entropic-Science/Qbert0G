@@ -10,6 +10,10 @@ Subcommands:
   and print the resolved shape without starting anything.
 - ``qbert0g sources list`` — every source in the namespace (devices,
   controls, profiles) with kind, transform, inputs and availability.
+- ``qbert0g sources watch --ids A[,B]`` — live bitstream viewer for
+  eyeballing generation-vs-display timing and cross-device synchrony
+  of the raw streams feeding an xnor gate. Reads go through the exact
+  SourceRouter paired-read serving path.
 - ``qbert0g profiles pull --id X --bytes N --out F`` — offline
   generation through the EXACT SourceRouter serving path (no gRPC, no
   gate), for feeding ent / PractRand; writes a provenance record with
@@ -25,6 +29,8 @@ import argparse
 import asyncio
 import logging
 import sys
+import time
+from collections.abc import Sequence
 from pathlib import Path
 
 from .config import Config, ConfigError
@@ -232,6 +238,91 @@ async def _run_sources_list(args: argparse.Namespace) -> None:
     await _with_router(config, _list)
 
 
+def render_watch_sample(
+    ids: Sequence[str],
+    chunks: Sequence[bytes],
+    capture_ns: Sequence[int],
+    render_ns: int,
+    skew_ns: int | None,
+    running_agree_bits: int = 0,
+    running_total_bits: int = 0,
+) -> tuple[str, int, int]:
+    """Render one watch sample → ``(text_block, agree_bits, total_bits)``.
+
+    Pure function (all timestamps passed in) so the format is golden-
+    testable. Bit order is the NORMATIVE profile convention (MSB first,
+    :func:`qbert0g.profiles.unpack_msb_first`). Layout per sample:
+    one line per stream (grouped bits, capture timestamp, capture-to-
+    render latency), and for pairs an agreement line between them —
+    ``|`` where the bits agree (the XNOR output), ``.`` where they
+    differ — with the row and running agreement % and the pair skew in
+    microseconds. Deliberately ASCII-only: the viewer must survive
+    cp1252 pipes on Windows consoles.
+    """
+    from .profiles import unpack_msb_first  # deferred: numpy is heavy for --help
+
+    width = max(len(i) for i in ids)
+    bit_rows = [unpack_msb_first(chunk) for chunk in chunks]
+
+    def _bits_text(bits) -> str:
+        text = "".join(str(b) for b in bits)
+        return " ".join(text[i : i + 8] for i in range(0, len(text), 8))
+
+    def _stream_line(idx: int) -> str:
+        lat_us = (render_ns - capture_ns[idx]) // 1000
+        return (
+            f"{ids[idx]:<{width}}  {_bits_text(bit_rows[idx])}  "
+            f"cap={capture_ns[idx]}ns  lat={lat_us}us"
+        )
+
+    if len(ids) == 1:
+        return _stream_line(0), 0, 0
+
+    agree = bit_rows[0] == bit_rows[1]  # XNOR of the two bitstreams
+    marks = _bits_text(agree.astype(int))
+    marks = marks.replace("1", "|").replace("0", ".")
+    row_agree, row_total = int(agree.sum()), int(agree.size)
+    running_pct = 100.0 * (running_agree_bits + row_agree) / (running_total_bits + row_total)
+    skew_us = (skew_ns or 0) // 1000
+    agree_line = (
+        f"{'agree':<{width}}  {marks}  "
+        f"{100.0 * row_agree / row_total:.1f}% (running {running_pct:.1f}%)  dt={skew_us}us"
+    )
+    block = "\n".join([_stream_line(0), agree_line, _stream_line(1)])
+    return block, row_agree, row_total
+
+
+async def _run_sources_watch(args: argparse.Namespace) -> None:
+    config = Config.load(args.config)
+    ids = [part.strip() for part in args.ids.split(",") if part.strip()]
+    if len(ids) not in (1, 2):
+        print("Error: --ids takes one or two comma-separated device ids", file=sys.stderr)
+        raise SystemExit(2)
+
+    async def _watch(router) -> None:
+        agree_bits = total_bits = 0
+        rows = 0
+        while args.rows is None or rows < args.rows:
+            sample = await router.watch_read(ids, args.bytes_per_row)
+            block, row_agree, row_total = render_watch_sample(
+                ids,
+                sample.chunks,
+                sample.capture_ns,
+                time.monotonic_ns(),
+                sample.skew_ns,
+                agree_bits,
+                total_bits,
+            )
+            agree_bits += row_agree
+            total_bits += row_total
+            print(block, flush=True)
+            rows += 1
+            if args.interval > 0 and (args.rows is None or rows < args.rows):
+                await asyncio.sleep(args.interval)
+
+    await _with_router(config, _watch)
+
+
 async def _run_profiles_pull(args: argparse.Namespace) -> None:
     config = Config.load(args.config)
 
@@ -356,6 +447,27 @@ def build_parser() -> argparse.ArgumentParser:
     sources_sub.add_parser(
         "list", help="List all devices, controls and profiles with availability"
     )
+    p_watch = sources_sub.add_parser(
+        "watch",
+        help="Live side-by-side bitstream viewer for one or two raw device streams",
+    )
+    p_watch.add_argument(
+        "--ids",
+        required=True,
+        help="One or two comma-separated device ids (e.g. dragonfly-0,dragonfly-1)",
+    )
+    p_watch.add_argument(
+        "--bytes-per-row", type=int, default=4, help="Bytes read per row (default: 4)"
+    )
+    p_watch.add_argument(
+        "--rows", type=int, default=None, help="Stop after N rows (default: until Ctrl-C)"
+    )
+    p_watch.add_argument(
+        "--interval",
+        type=float,
+        default=0.5,
+        help="Seconds between rows (default: 0.5; 0 = as fast as the devices allow)",
+    )
 
     p_profiles = sub.add_parser("profiles", help="Offline profile operations")
     p_profiles.add_argument("--config", help="Path to config.yaml")
@@ -381,9 +493,14 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "keys":
             asyncio.run(_run_keys(args))
         elif args.command == "sources":
-            asyncio.run(_run_sources_list(args))
+            if args.sources_command == "watch":
+                asyncio.run(_run_sources_watch(args))
+            else:
+                asyncio.run(_run_sources_list(args))
         elif args.command == "profiles":
             asyncio.run(_run_profiles_pull(args))
+    except KeyboardInterrupt:
+        pass  # Ctrl-C on `sources watch` (and friends) exits cleanly
     except ConfigError as exc:
         print(f"Config error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc

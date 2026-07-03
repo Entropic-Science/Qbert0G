@@ -33,6 +33,15 @@ import numpy as np
 from .config import TRANSFORM_ARITY, ProfileConfig
 
 
+def unpack_msb_first(data: bytes) -> np.ndarray:
+    """Bytes → bit array in the NORMATIVE order (MSB first within each byte).
+
+    The single unpack seam shared by the transforms and the CLI bitstream
+    viewer, so every bit-level view of a stream agrees on bit order.
+    """
+    return np.unpackbits(np.frombuffer(data, np.uint8))
+
+
 def identity(a: bytes) -> bytes:
     """Passthrough of one input."""
     return a
@@ -72,7 +81,7 @@ def parity(raw: bytes, out_bytes: int, taps: Sequence[int], stride: int) -> byte
             f"parity needs {need} input bits ({(need + 7) // 8} bytes) for "
             f"{out_bytes} output bytes, got {len(raw)} bytes"
         )
-    bits = np.unpackbits(np.frombuffer(raw, np.uint8))[:need]
+    bits = unpack_msb_first(raw)[:need]
     idx = stride * np.arange(m)
     out = np.zeros(m, np.uint8)
     for t in taps:

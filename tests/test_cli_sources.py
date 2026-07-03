@@ -16,7 +16,7 @@ from pathlib import Path
 import yaml
 from conftest import SEED_A, SEED_B
 
-from qbert0g.cli import main
+from qbert0g.cli import main, render_watch_sample
 from qbert0g.controls import uniform_stream_bytes
 from qbert0g.profiles import xnor
 
@@ -25,7 +25,7 @@ def _write_config(tmp_path: Path) -> Path:
     data = {
         "server": {"listen": "127.0.0.1:0"},
         "database": {"path": str(tmp_path / "cli.db")},
-        "devices": [{"id": "mock-0", "type": "mock"}],
+        "devices": [{"id": "mock-0", "type": "mock"}, {"id": "mock-1", "type": "mock"}],
         "controls": [
             {"id": "prng-a", "type": "prng_uniform", "seed": SEED_A},
             {"id": "prng-b", "type": "prng_uniform", "seed": SEED_B},
@@ -94,3 +94,74 @@ class TestProfilesPull:
             for fact in record["inputs"]
         ]
         assert served == xnor(streams[0], streams[1])
+
+
+class TestSourcesWatch:
+    """`sources watch` — the bitstream sync viewer (spec §14 addendum)."""
+
+    def test_golden_render_pair(self):
+        # 0xFF agrees on all 8 bits; 0x0F vs 0xF0 disagrees on all 8.
+        block, agree, total = render_watch_sample(
+            ids=["dev-a", "dev-b"],
+            chunks=[b"\xff\x0f", b"\xff\xf0"],
+            capture_ns=[1_000, 3_000],
+            render_ns=501_000,
+            skew_ns=2_000,
+        )
+        assert block == (
+            "dev-a  11111111 00001111  cap=1000ns  lat=500us\n"
+            "agree  |||||||| ........  50.0% (running 50.0%)  dt=2us\n"
+            "dev-b  11111111 11110000  cap=3000ns  lat=498us"
+        )
+        assert (agree, total) == (8, 16)
+
+    def test_render_running_percentage_accumulates(self):
+        block, _, _ = render_watch_sample(
+            ids=["a", "b"],
+            chunks=[b"\xff", b"\xff"],  # this row: 100% agreement
+            capture_ns=[0, 0],
+            render_ns=0,
+            skew_ns=0,
+            running_agree_bits=0,
+            running_total_bits=8,  # prior row: 0% agreement
+        )
+        assert "100.0% (running 50.0%)" in block
+
+    def test_golden_render_single_stream(self):
+        block, agree, total = render_watch_sample(
+            ids=["mock-0"],
+            chunks=[b"\xb4"],
+            capture_ns=[2_000],
+            render_ns=12_000,
+            skew_ns=None,
+        )
+        assert block == "mock-0  10110100  cap=2000ns  lat=10us"
+        assert (agree, total) == (0, 0)  # no agreement accounting in single mode
+
+    def test_watch_end_to_end_against_two_mocks(self, tmp_path, capsys):
+        config = _write_config(tmp_path)
+        main([
+            "sources", "--config", str(config), "watch",
+            "--ids", "mock-0,mock-1", "--rows", "3", "--interval", "0",
+            "--bytes-per-row", "4",
+        ])
+        lines = capsys.readouterr().out.splitlines()
+        blocks = [line for line in lines if line.startswith("mock-")]
+        agree_lines = [line for line in lines if line.startswith("agree")]
+        assert len(blocks) == 6  # 3 rows x 2 streams
+        assert len(agree_lines) == 3
+        for line in agree_lines:
+            assert "running" in line and "dt=" in line
+        # 4 bytes per row -> 32 bit columns, grouped 8 per byte
+        assert blocks[0].count(" ") >= 3 and "cap=" in blocks[0] and "lat=" in blocks[0]
+
+    def test_watch_single_stream_mode(self, tmp_path, capsys):
+        config = _write_config(tmp_path)
+        main([
+            "sources", "--config", str(config), "watch",
+            "--ids", "mock-0", "--rows", "2", "--interval", "0",
+        ])
+        lines = capsys.readouterr().out.splitlines()
+        assert len(lines) == 2
+        assert all(line.startswith("mock-0") for line in lines)
+        assert not any("agree" in line for line in lines)

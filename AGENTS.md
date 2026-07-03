@@ -46,7 +46,8 @@ all of the above ──► config.py   (config.py imports nothing internal;
 - `sources.py` — `SourceRouter`: ONE id namespace over devices + controls +
   profiles; paired-read choreography (lexicographic lock order, alternating
   chunks, skew measurement); `ProvenanceLog` (append-only JSONL, one record
-  per served request).
+  per served request); `watch_read` (raw device samples for the CLI
+  `sources watch` bitstream viewer, through the same paired-read path).
 - `gate.py` — `RequestGate.measure(context, n, protocol=..., sequence_id=...)`:
   auth → rate limit → byte caps → source read → provenance → usage record.
   **Every RPC of both services goes through this one method**; never add a

@@ -148,7 +148,23 @@ qbert0g keys create --name study-arm --device qq-match   # keys bind to any sour
 qbert0g profiles pull --id qq-match --bytes 100000000 --out qq.bin
     # offline generation through the EXACT serving code path (for ent/PractRand);
     # writes a provenance record marked protocol: "cli"
+qbert0g sources watch --ids dragonfly-0,dragonfly-1
+    # live bitstream sync viewer (see below)
 ```
+
+### Bitstream sync viewer
+
+`qbert0g sources watch --ids A[,B] [--bytes-per-row 4] [--rows N] [--interval S]`
+prints the raw bitstreams of one or two devices side by side, one small
+paired read per row **through the exact serving choreography** (lock
+order, request-start freshness flush, per-chunk monotonic timestamps).
+Each row shows the per-source capture timestamp, the capture→print
+latency (the "physical generation vs displayed" measure), and — for a
+pair — an agreement line between the streams (`|` where the bits agree,
+which is exactly the XNOR gate's output; `.` where they differ) with a
+running agreement % and the pair skew `dt` in µs. Output is ASCII-only
+(survives cp1252 pipes). Works against `mock` devices, so it is
+demoable anywhere; Ctrl-C exits cleanly.
 
 ## API key management
 

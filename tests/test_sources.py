@@ -257,3 +257,25 @@ class TestDescribe:
         rows = {r["id"]: r for r in router.describe()}
         assert "unavailable" in rows["qq-mock"]["availability"]
         assert "mock-1" in rows["qq-mock"]["availability"]
+
+
+class TestWatchRead:
+    """`sources watch` seam: raw samples through the real serving choreography."""
+
+    async def test_paired_sample_has_chunks_stamps_and_skew(self, router):
+        sample = await router.watch_read(["mock-0", "mock-1"], 4)
+        assert [len(c) for c in sample.chunks] == [4, 4]
+        assert len(sample.capture_ns) == 2
+        assert all(ts > 0 for ts in sample.capture_ns)
+        assert sample.skew_ns is not None and sample.skew_ns >= 0
+
+    async def test_single_sample_has_no_skew(self, router):
+        sample = await router.watch_read(["mock-0"], 4)
+        assert len(sample.chunks) == 1 and len(sample.chunks[0]) == 4
+        assert sample.skew_ns is None
+
+    async def test_non_device_ids_are_rejected(self, router):
+        with pytest.raises(SourceUnavailableError, match="not a device"):
+            await router.watch_read(["prng-a"], 4)
+        with pytest.raises(SourceUnavailableError, match="not a device"):
+            await router.watch_read(["pp-match", "mock-0"], 4)

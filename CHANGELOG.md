@@ -27,6 +27,17 @@
   health snapshot), PRNG `seed` + `stream_offset_bytes` + `model_sha256`.
   Write failure logs ERROR and serves the request; `strict: true` inverts
   (request fails `INTERNAL`) for study runs.
+- **CLI: `qbert0g sources watch --ids A[,B]`** — bitstream sync viewer
+  (spec §14 addendum): one small paired read per row through the exact
+  SourceRouter serving choreography (lexicographic lock order,
+  request-start flush, per-chunk monotonic-ns timestamps); prints the raw
+  streams side by side (MSB-first, the normative profile bit order) with
+  per-source capture timestamps, capture→print latency, an agreement line
+  (`|` agree = the XNOR output, `.` differ) with running agreement %, and
+  the pair skew `dt` in µs (ASCII-only output — survives cp1252 pipes).
+  Single-id mode drops the agreement line.
+  Devices only; no provenance — an operator eyeball tool, not a serving
+  endpoint.
 - **CLI: `qbert0g sources list`** (devices/controls/profiles with kind,
   transform, inputs, availability) and **`qbert0g profiles pull --id X
   --bytes N --out F`** — offline generation through the EXACT SourceRouter
