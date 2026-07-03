@@ -15,10 +15,13 @@ Or `make check`. A change is not done until both pass.
 ## Layering (imports point downward only)
 
 ```
-cli.py  ──►  server.py  ──►  gate.py  ──►  devices.py
-                 │               │
-                 └──► proto/     └──► database.py
-all of the above ──► config.py   (config.py imports nothing internal)
+cli.py  ──►  server.py  ──►  gate.py  ──►  sources.py (SourceRouter)
+                 │               │             ├──► profiles.py  (transforms)
+                 └──► proto/     │             ├──► controls.py  (PRNG sources)
+                                 │             └──► devices.py
+                                 └──► database.py
+all of the above ──► config.py   (config.py imports nothing internal;
+                                  profiles.py/controls.py import ONLY config.py)
 ```
 
 - `config.py` — strict schema; **unknown keys are a startup error**. All
@@ -31,10 +34,23 @@ all of the above ──► config.py   (config.py imports nothing internal)
   `error_bits` health snapshot when `pci_address` is set) + `MockDevice`
   (os.urandom, dev only). Per-device asyncio locks, failover routing,
   freshness flush before EVERY read (config-gated) — `_flush_input` is the
-  single pre-measurement seam for all device types.
-- `gate.py` — `RequestGate.measure(context, n)`: auth → rate limit → byte
-  caps → device read → usage record. **Every RPC of both services goes
-  through this one method**; never add a second validation path.
+  single pre-measurement seam for all device types. The SourceRouter seam
+  (`acquire_for_profile` + `read_chunk_locked`) holds ONE device with a
+  single request-start flush for chunked paired reads.
+- `controls.py` — seeded PRNG sources (`prng_uniform`, `prng_markov`),
+  loudly NOT quantum; every served block regenerable offline from
+  `(id, seed, stream_offset_bytes)`.
+- `profiles.py` — pure NORMATIVE transforms (`identity`, `xnor`, `parity`;
+  bit order = numpy unpackbits/packbits, MSB first) + the `Profile`
+  descriptor. No I/O.
+- `sources.py` — `SourceRouter`: ONE id namespace over devices + controls +
+  profiles; paired-read choreography (lexicographic lock order, alternating
+  chunks, skew measurement); `ProvenanceLog` (append-only JSONL, one record
+  per served request).
+- `gate.py` — `RequestGate.measure(context, n, protocol=..., sequence_id=...)`:
+  auth → rate limit → byte caps → source read → provenance → usage record.
+  **Every RPC of both services goes through this one method**; never add a
+  second validation path. API keys bind to ANY source id.
 - `server.py` — the two servicers + `QbertServer` (testable start/stop) +
   `serve()` (signals). Binds TCP and/or UDS.
 - `proto/` — `qrng.proto` (public) + `entropy_service.proto` (byte-identical
@@ -68,6 +84,18 @@ Load-bearing details:
    keep this auditable; don't weaken them.
 5. **Entropy locality is deployment policy, not code**: binding `0.0.0.0` is
    allowed but warned. qthought deployments bind loopback/UDS only.
+6. **Profiles never fail over.** An experiment arm's composition is fixed:
+   any unavailable input fails the request `UNAVAILABLE`. Plain device ids
+   keep classic failover. Never "helpfully" substitute an input.
+7. **Provenance never fails a request** (write failure → ERROR log, request
+   served) — unless `provenance.strict: true`, which inverts this for study
+   runs. Per-input `kind` (`"quantum"` / `"prng"` / `"mock"`) must always be
+   recorded; pseudorandom involvement is never laundered.
+8. **No entropy/uniformity threshold is ever a pass criterion on served
+   output** — matched-distribution PRNG controls are legitimately
+   non-uniform. The pipeline proof is provenance replay: regenerate a served
+   block offline from its record alone and assert byte identity. Statistical
+   assertions live ONLY in transform unit tests against constructed inputs.
 
 ## How to extend
 
@@ -82,6 +110,16 @@ Load-bearing details:
   to the `_check_keys` allowlist, a default, and a test in `tests/test_config.py`.
 - **New RPC/service**: implement the servicer in `server.py`, route every
   request through `RequestGate.measure`, register it in `QbertServer.start`.
+- **New transform**: pure function in `profiles.py` (pin its bit order in a
+  comment AND a test) + arity entry in `config.py:TRANSFORM_ARITY` + a branch
+  in `Profile.apply`/`raw_bytes_needed` + param validation in
+  `config._parse_profiles` if it takes params + golden-vector tests. The
+  SourceRouter needs no changes unless the read choreography differs.
+- **New control type**: class in `controls.py` exposing `read(n)`,
+  `stream_offset_bytes`, `kind = "prng"` and a `config` attr; register in
+  `make_control` + `config.py:CONTROL_TYPES`. Keep it seeded and offline-
+  regenerable — record whatever facts regeneration needs in the provenance
+  fact (see `SourceRouter._control_bytes`).
 
 ## Cross-repo context
 

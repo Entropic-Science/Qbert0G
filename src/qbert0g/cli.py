@@ -269,6 +269,8 @@ def _cmd_check_config(args: argparse.Namespace) -> None:
     print(f"  flush_on_request: {config.freshness.flush_device_buffer}")
     print(f"  auth header:      {config.auth.header}")
     print(f"  bootstrap admin:  {'yes' if config.auth.api_key else 'no'}")
+    strictness = "strict" if config.provenance.strict else "best-effort"
+    print(f"  provenance:       {config.provenance.path} ({strictness})")
     print(f"  devices:          {len(config.devices)}")
     for dev in config.devices:
         if dev.type == "chardev":

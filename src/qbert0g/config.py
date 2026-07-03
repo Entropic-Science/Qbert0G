@@ -48,6 +48,8 @@ CONTROL_TYPES = frozenset({"prng_uniform", "prng_markov"})
 #: implementations live in profiles.py; the arity map lives HERE so
 #: config validation and the transform library share one source of
 #: truth without config.py importing anything internal.
+#: Deferred (spec §12): >2-ary transforms and profile nesting are
+#: deliberately out of scope for v1 — new arities would be added here.
 TRANSFORM_ARITY = {"identity": 1, "xnor": 2, "parity": 1}
 
 #: PRNG seeds are exactly 128 bits: ``0x`` + 32 hex digits. Required —

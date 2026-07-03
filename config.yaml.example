@@ -105,8 +105,8 @@ devices:
 # statistical controls for the quantum devices in experiment arms. `seed`
 # is REQUIRED (128-bit hex: 0x + 32 digits; no silent time-seeding) so any
 # served block is regenerable offline from (id, seed, stream_offset_bytes).
-# NOTE: validated at startup; served ids become addressable once the
-# SourceRouter lands (see CHANGELOG, Unreleased).
+# API keys bind to control ids exactly like device ids
+# (`qbert0g keys create --device prng-uniform-0`).
 controls:
   - id: "prng-uniform-0"
     type: "prng_uniform"          # numpy PCG64 raw 64-bit output stream
@@ -149,7 +149,31 @@ profiles:
   #   inputs: ["dragonfly-0"]
   #   params: { taps: [0, 9, 19, 30], stride: 4, allow_period4: true }
 
-# Shared knobs for profile serving (paired reads).
+# Shared knobs for profile serving (paired reads). When BOTH xnor inputs
+# are hardware devices, the server locks the two devices (lexicographic id
+# order), flushes each once at request start, then reads alternating
+# chunks of `chunk_bytes` with a monotonic-ns timestamp per chunk. The
+# max over chunk pairs of |t_A - t_B| is logged to provenance as
+# `max_pair_skew_ns`; if it exceeds `max_skew_ns` the response is served
+# anyway but a WARNING is logged (data is not wrong, the simultaneity
+# bound is just looser than intended). Profiles NEVER fail over: if an
+# input is unavailable the request fails UNAVAILABLE — an experiment arm
+# must never silently change composition.
 profiles_defaults:
   chunk_bytes: 4096               # alternating paired-read chunk size
   max_skew_ns: 50000000           # pair-skew WARNING threshold (50 ms)
+
+# ── Provenance log ───────────────────────────────────────────────────────────
+# Append-only JSONL, ONE record per served request (all protocols AND
+# `qbert0g profiles pull`): source id, protocol, sequence_id, served
+# bytes, transform, per-input facts — hardware inputs carry raw_bytes /
+# chunk timestamps / flushed_bytes / error_present / error_bits (from the
+# chardev health snapshot); PRNG inputs carry seed / stream_offset_bytes /
+# model_sha256, so any pseudorandom involvement is explicit and greppable
+# (`"kind":"prng"`), and every PRNG-served block is regenerable offline.
+provenance:
+  path: "./provenance.jsonl"
+  # strict: false (default) — a provenance write failure logs ERROR and
+  # the request is still served. Set true for study runs: a request whose
+  # provenance cannot be recorded then fails (gRPC INTERNAL).
+  strict: false
