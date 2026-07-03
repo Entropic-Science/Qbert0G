@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package qr_entropy;
+
+// Entropy generation service.
+//
+// Provides random bytes on demand, with three transport modes:
+//   - GetEntropy (unary): simplest, one request → one response
+//   - StreamEntropy (bidirectional): persistent stream for lowest latency
+//
+// All modes satisfy the just-in-time constraint: entropy is generated
+// only after the client sends a request.
+
+service EntropyService {
+  // Simple request-response (unary mode).
+  rpc GetEntropy (EntropyRequest) returns (EntropyResponse);
+
+  // Persistent bidirectional stream (bidi and server-streaming modes).
+  rpc StreamEntropy (stream EntropyRequest) returns (stream EntropyResponse);
+}
+
+message EntropyRequest {
+  int32 bytes_needed = 1;          // Number of random bytes requested
+  int64 sequence_id = 2;           // Correlates request to response in streaming
+}
+
+message EntropyResponse {
+  bytes data = 1;                  // Random bytes
+  int64 sequence_id = 2;          // Matches the request's sequence_id
+  int64 generation_timestamp_ns = 3; // When physical entropy was generated
+  string device_id = 4;           // QRNG hardware identifier
+}

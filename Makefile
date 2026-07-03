@@ -1,39 +1,42 @@
-.PHONY: help proto clean install run
+.PHONY: help proto install dev test check clean run config
 
 help:
-	@echo "QRNG gRPC Service - Makefile"
+	@echo "Qbert0G - Makefile"
 	@echo ""
 	@echo "Available targets:"
-	@echo "  make proto    - Generate Python code from protobuf definitions"
-	@echo "  make install  - Install Python dependencies"
-	@echo "  make clean    - Clean generated files and caches"
-	@echo "  make run      - Run the gRPC server"
+	@echo "  make install  - Install the package (pip install .)"
+	@echo "  make dev      - Editable install with dev extras"
+	@echo "  make proto    - Regenerate protobuf stubs from .proto files"
+	@echo "  make test     - Run the test suite"
+	@echo "  make check    - Lint (ruff) + tests"
+	@echo "  make run      - Run the server (needs ./config.yaml)"
 	@echo "  make config   - Copy example config to config.yaml"
-
-proto:
-	@echo "Generating protobuf code..."
-	python -m grpc_tools.protoc \
-		-I. \
-		--python_out=. \
-		--grpc_python_out=. \
-		proto/qrng.proto
-	@echo "Done! Generated proto/qrng_pb2.py and proto/qrng_pb2_grpc.py"
+	@echo "  make clean    - Clean caches"
 
 install:
-	@echo "Installing dependencies..."
-	pip install -r requirements.txt
-	@echo "Done!"
+	pip install .
+
+dev:
+	pip install -e .[dev]
 	@echo ""
-	@echo "NOTE: You still need to install pyqcc manually:"
+	@echo "NOTE: hardware devices additionally need pyqcc (wheel from Crypta Labs):"
 	@echo "  pip install /path/to/pyqcc-x.y.z-py3-none-any.whl"
 
-clean:
-	@echo "Cleaning generated files and caches..."
-	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-	find . -type f -name "*.pyc" -delete
-	find . -type f -name "*.pyo" -delete
-	rm -rf proto/*_pb2.py proto/*_pb2_grpc.py 2>/dev/null || true
-	@echo "Done!"
+proto:
+	python -m grpc_tools.protoc -Isrc \
+		--python_out=src --grpc_python_out=src \
+		src/qbert0g/proto/qrng.proto src/qbert0g/proto/entropy_service.proto
+	@echo "Regenerated src/qbert0g/proto/*_pb2*.py"
+
+test:
+	python -m pytest tests/ -v
+
+check:
+	python -m ruff check .
+	python -m pytest tests/ -q
+
+run:
+	qbert0g serve
 
 config:
 	@if [ -f config.yaml ]; then \
@@ -43,9 +46,6 @@ config:
 		echo "Created config.yaml from example. Please edit it!"; \
 	fi
 
-run:
-	@if [ ! -f config.yaml ]; then \
-		echo "ERROR: config.yaml not found. Run 'make config' first."; \
-		exit 1; \
-	fi
-	python run.py
+clean:
+	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+	rm -rf .pytest_cache .ruff_cache build dist *.egg-info src/*.egg-info

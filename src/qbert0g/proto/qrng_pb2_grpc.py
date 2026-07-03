@@ -3,9 +3,9 @@
 import grpc
 import warnings
 
-from proto import qrng_pb2 as proto_dot_qrng__pb2
+from qbert0g.proto import qrng_pb2 as qbert0g_dot_proto_dot_qrng__pb2
 
-GRPC_GENERATED_VERSION = '1.78.1'
+GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in proto/qrng_pb2_grpc.py depends on'
+        + ' but the generated code in qbert0g/proto/qrng_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -37,8 +37,8 @@ class QuantumRNGStub(object):
         """
         self.GetRandomBytes = channel.unary_unary(
                 '/qrng.QuantumRNG/GetRandomBytes',
-                request_serializer=proto_dot_qrng__pb2.RandomRequest.SerializeToString,
-                response_deserializer=proto_dot_qrng__pb2.RandomResponse.FromString,
+                request_serializer=qbert0g_dot_proto_dot_qrng__pb2.RandomRequest.SerializeToString,
+                response_deserializer=qbert0g_dot_proto_dot_qrng__pb2.RandomResponse.FromString,
                 _registered_method=True)
 
 
@@ -58,8 +58,8 @@ def add_QuantumRNGServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'GetRandomBytes': grpc.unary_unary_rpc_method_handler(
                     servicer.GetRandomBytes,
-                    request_deserializer=proto_dot_qrng__pb2.RandomRequest.FromString,
-                    response_serializer=proto_dot_qrng__pb2.RandomResponse.SerializeToString,
+                    request_deserializer=qbert0g_dot_proto_dot_qrng__pb2.RandomRequest.FromString,
+                    response_serializer=qbert0g_dot_proto_dot_qrng__pb2.RandomResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -88,8 +88,8 @@ class QuantumRNG(object):
             request,
             target,
             '/qrng.QuantumRNG/GetRandomBytes',
-            proto_dot_qrng__pb2.RandomRequest.SerializeToString,
-            proto_dot_qrng__pb2.RandomResponse.FromString,
+            qbert0g_dot_proto_dot_qrng__pb2.RandomRequest.SerializeToString,
+            qbert0g_dot_proto_dot_qrng__pb2.RandomResponse.FromString,
             options,
             channel_credentials,
             insecure,

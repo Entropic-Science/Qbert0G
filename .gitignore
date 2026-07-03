@@ -76,3 +76,6 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Ruff
+.ruff_cache/

@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qbert0g"
+version = "1.0.0"
+description = "gRPC service streaming freshly measured quantum noise from Crypta Labs QRNG devices"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+authors = [{ name = "Entropic Science" }]
+dependencies = [
+    "grpcio>=1.60.0",
+    "protobuf>=4.25.0",
+    "pyyaml>=6.0.1",
+    "aiosqlite>=0.19.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "grpcio-tools>=1.60.0",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+[project.urls]
+Repository = "https://github.com/Entropic-Science/Qbert0G"
+
+[project.scripts]
+qbert0g = "qbert0g.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+qbert0g = ["proto/*.proto"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["src/qbert0g/proto/*_pb2.py", "src/qbert0g/proto/*_pb2_grpc.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]

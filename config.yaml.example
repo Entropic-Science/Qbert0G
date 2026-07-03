@@ -1,78 +1,74 @@
-# QRNG gRPC Service Configuration
-# Copy this file to config.yaml and customize for your setup.
+# Qbert0G configuration
+# Copy to config.yaml and customize. Validation is strict: unknown keys
+# are rejected at startup (a typo must never change what randomness is served).
 
-# Service settings
-service:
-  host: "0.0.0.0"
-  port: 50051              # gRPC port (different from FastAPI)
-  request_timeout: 5.0     # Max seconds to wait for device availability
-  max_bytes_per_request: 16384  # Default max bytes per request (overridable per key)
-  database_path: "./qrng_grpc.db"  # Separate database from FastAPI service
-  failover_enabled: true   # Enable automatic failover to similar devices when primary is unavailable
-  default_rate_limit: 200              # Default requests per minute per API key
-  default_daily_byte_limit: 104857600  # Default daily byte limit per key (100 MB)
-  max_message_size: 16777216           # Max gRPC message size (16 MB)
+# ── Wire / transport ─────────────────────────────────────────────────────────
+server:
+  # TCP bind (host:port). 127.0.0.1 keeps the service on-box; bind 0.0.0.0
+  # ONLY if you deliberately want to serve entropy to other machines.
+  listen: "127.0.0.1:50051"
+  # UNIX domain socket — the preferred transport for co-located clients
+  # (lowest latency). Leave empty to disable. Not available on Windows.
+  unix_socket: ""
+  request_timeout: 5.0        # seconds to wait for an available device
+  max_message_size: 16777216  # 16 MB
+  failover_enabled: true      # route to another device if the primary is busy/down
 
-# Bootstrap admin API key
-# Set this to create an initial admin account on first startup.
-# Generate a secure key with: python -c "import secrets; print(secrets.token_urlsafe(32))"
-# Remove or comment out after creating your own admin keys.
-#admin_api_key: "CHANGE_ME_TO_A_SECURE_RANDOM_STRING"
+# ── Database (API keys + usage tracking) ─────────────────────────────────────
+database:
+  path: "./qbert0g.db"
 
-# QRNG Device Configuration
-# List all your Crypta Labs devices here.
-#
-# Device types:
-#   - firefly: PCIe devices (high throughput, ~20 Mbps)
-#   - qcicada: USB devices (lower throughput, ~0.5 Mbps)
-#
-# Device paths:
-#   - Firefly: /dev/ttyACM* (USB-CDC interface)
-#   - QCicada: /dev/ttyUSB* (FTDI USB Serial)
-#   Use 'dmesg | grep -E "tty(ACM|USB)"' to find actual paths
-#
-# Post-Processing Modes:
-#   - 0: Enabled (default) - SHA256 post-processing, NIST compliant
-#   - 1: Raw Noise - QOM data with health test conditioning
-#   - 2: Raw Samples - Direct QOM output, no conditioning
-#
-#   Mode 0 is recommended for cryptographic use.
-#   Modes 1 and 2 provide less processed data that may be useful
-#   for consciousness-influenceable LLM applications or research.
-#
-# Fallback routing priority:
-#   1. Primary device assigned to API key
-#   2. Other devices of the same type
-#   3. Devices of different type
-#
-#   NOTE: When fallback occurs, each device uses its own post-processing mode.
-#   So a request to a mode-2 device that falls back to a mode-0 device
-#   will receive mode-0 data (fully post-processed).
-#
+# ── API-key auth ─────────────────────────────────────────────────────────────
+auth:
+  # Bootstrap admin key: created in the database (device "*") on first
+  # startup if not already present. Manage further keys with `qbert0g keys`.
+  # Changing this later ADDS a new admin; revoke old keys explicitly.
+  api_key: "sample-only-your-secure-bootstrap-key"
+  # gRPC metadata header clients send the key in.
+  header: "api-key"
+
+# ── Service-wide default caps (overridable per API key) ──────────────────────
+limits:
+  max_bytes_per_request: 16384
+  max_bytes_per_day: 104857600   # 100 MB
+  rate_limit_per_minute: 200
+
+# ── Post-processing ──────────────────────────────────────────────────────────
+post_processing:
+  # raw | sha256 | raw_samples  (maps to qcc-cli -P 1 | 0 | 2).
+  # Entropy-research deployments (e.g. qthought) REQUIRE raw — SHA-256
+  # launders away exactly the signal they study. Devices may override
+  # individually via devices[].post_processing.
+  mode: raw
+
+# ── Freshness (the just-in-time measurement contract) ────────────────────────
+freshness:
+  # Flush the serial device read buffer immediately before EVERY measurement
+  # so no byte measured before the request is ever served.
+  flush_device_buffer: true
+  # Stamp responses with the measurement time (RandomResponse.timestamp in µs,
+  # EntropyResponse.generation_timestamp_ns in ns).
+  emit_generation_timestamp: true
+  # Declarative guards: this server has no pooling/pre-generation to enable.
+  # Setting either to true is refused at startup.
+  allow_pooling: false
+  allow_pregeneration: false
+
+# ── Devices ──────────────────────────────────────────────────────────────────
+# Types: firefly (PCIe), qcicada (USB), dragonfly (high-rate serial) — all
+# driven via pyqcc — and mock (os.urandom; NOT quantum; dev/testing only).
 devices:
-  # Firefly PCIe devices (appear as /dev/ttyACM*)
   - id: "firefly-1"
     type: "firefly"
     path: "/dev/ttyACM0"
-    baud_rate: 115200
-    timeout: 5.0
     enabled: true
-    post_processing_mode: 1 # Raw noise (health test conditioned)
-
-  - id: "firefly-2"
-    type: "firefly"
-    path: "/dev/ttyACM1"
-    baud_rate: 115200
-    timeout: 5.0
-    enabled: true
-    post_processing_mode: 1 # Raw noise (health test conditioned)
-
-  # QCicada USB devices (appear as /dev/ttyUSB*)
-  # Check actual device paths with: dmesg | grep ttyUSB
-  #- id: "qcicada-1"
-  #  type: "qcicada"
-  #  path: "/dev/ttyUSB0"
-  #  baud_rate: 115200
-  #  timeout: 5.0
-  #  enabled: false
-  #  post_processing_mode: 1  # Raw noise (health test conditioned)
+    # streaming_mode: true        # keep the device in continuous mode
+    # streaming_idle_timeout: 10  # minutes idle before sleeping (0 = never)
+    # post_processing: raw        # per-device override of the global mode
+  # - id: "dragonfly-0"
+  #   type: "dragonfly"
+  #   path: "/dev/ttyQRNG0"
+  #   streaming_mode: true
+  #   rate_mbit_s: 350            # informational (capacity notes)
+  # - id: "mock-0"                # development only — loudly logged, NOT quantum
+  #   type: "mock"
