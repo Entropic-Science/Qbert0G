@@ -2,8 +2,10 @@
 
 Both gRPC services (``qrng.QuantumRNG`` and ``qr_entropy.EntropyService``)
 funnel every request through :meth:`RequestGate.measure`, so auth, rate
-limiting, byte caps, device routing and usage accounting behave
-identically regardless of which protocol a client speaks.
+limiting, byte caps, source routing (devices, PRNG controls, profiles —
+via the :class:`~qbert0g.sources.SourceRouter`), provenance logging and
+usage accounting behave identically regardless of which protocol a
+client speaks.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ import grpc
 
 from .config import Config
 from .database import Database
-from .devices import DeviceManager
+from .sources import ProvenanceWriteError, SourceRouter, SourceUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -47,25 +49,40 @@ class Measurement:
     """One completed entropy measurement."""
 
     data: bytes
-    device_id: str
-    timestamp_ns: int  # measurement time (epoch ns); 0 when emission is off
+    device_id: str  # the SERVING source id: device, control, or profile
+    timestamp_ns: int  # last contributing measurement (epoch ns); 0 when emission is off
 
 
 class RequestGate:
-    """Auth + limits + device read, shared by all gRPC services."""
+    """Auth + limits + source read, shared by all gRPC services.
 
-    def __init__(self, config: Config, db: Database, devices: DeviceManager) -> None:
+    The read step goes through the :class:`SourceRouter`, so API keys
+    bind to ANY source id — device, PRNG control, or profile — with one
+    unchanged validation pipeline. Byte caps, rate limits, and usage
+    accounting apply to SERVED bytes; raw input consumption of profiles
+    is a provenance fact, not a limits fact.
+    """
+
+    def __init__(self, config: Config, db: Database, router: SourceRouter) -> None:
         self._config = config
         self._db = db
-        self._devices = devices
+        self._router = router
         self._rate_limiter = RateLimiter()
 
-    async def measure(self, context: grpc.aio.ServicerContext, num_bytes: int) -> Measurement:
+    async def measure(
+        self,
+        context: grpc.aio.ServicerContext,
+        num_bytes: int,
+        *,
+        protocol: str,
+        sequence_id: int | None = None,
+    ) -> Measurement:
         """Validate the request end-to-end and read fresh bytes.
 
         Aborts the RPC (raising) with the appropriate status code on any
-        failure; on success records usage and returns a
-        :class:`Measurement` stamped at read-completion time.
+        failure; on success writes the provenance record, records usage,
+        and returns a :class:`Measurement`. *protocol* / *sequence_id*
+        exist solely for the provenance record.
         """
         config = self._config
 
@@ -116,27 +133,43 @@ class RequestGate:
                 f"Limit: {daily_limit}",
             )
 
-        # ── device routing ──────────────────────────────────────────────
-        primary_device = key_info["primary_device_id"]
-        if primary_device == "*":
-            if self._devices.devices:
-                primary_device = next(iter(self._devices.devices))
-            else:
+        # ── source routing ──────────────────────────────────────────────
+        primary_source = key_info["primary_device_id"]  # binds to ANY source id
+        if primary_source == "*":
+            primary_source = self._router.default_device_id()
+            if primary_source is None:
                 await context.abort(grpc.StatusCode.UNAVAILABLE, "No devices available")
 
         try:
-            data, serving_device = await self._devices.read_bytes(
-                primary_device, num_bytes, timeout=config.server.request_timeout
+            read = await self._router.read(
+                primary_source, num_bytes, timeout=config.server.request_timeout
             )
         except TimeoutError:
             await context.abort(
                 grpc.StatusCode.DEADLINE_EXCEEDED, "Request timed out waiting for device"
             )
+        except SourceUnavailableError as exc:
+            logger.error("Source unavailable: %s", exc)
+            await context.abort(grpc.StatusCode.UNAVAILABLE, str(exc))
         except Exception as exc:
-            logger.error("Device error: %s", exc)
-            await context.abort(grpc.StatusCode.UNAVAILABLE, f"Device error: {exc}")
+            logger.error("Source error: %s", exc)
+            await context.abort(grpc.StatusCode.UNAVAILABLE, f"Source error: {exc}")
 
-        timestamp_ns = time.time_ns() if self._config.freshness.emit_generation_timestamp else 0
+        timestamp_ns = read.timestamp_ns if self._config.freshness.emit_generation_timestamp else 0
+
+        try:
+            self._router.record_provenance(
+                read,
+                protocol=protocol,
+                served_bytes=num_bytes,
+                sequence_id=sequence_id,
+                api_key_id=key_info["id"],
+            )
+        except ProvenanceWriteError as exc:
+            # provenance.strict: an unrecorded request must not be served.
+            await context.abort(grpc.StatusCode.INTERNAL, str(exc))
 
         await self._db.record_usage(key_info["id"], num_bytes)
-        return Measurement(data=bytes(data), device_id=serving_device, timestamp_ns=timestamp_ns)
+        return Measurement(
+            data=bytes(read.data), device_id=read.source_id, timestamp_ns=timestamp_ns
+        )

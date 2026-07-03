@@ -126,6 +126,97 @@ class TestEntropyService:
         assert usage["requests"] == 2
 
 
+class TestProfileSources:
+    """Profiles served through the SAME gate pipeline, both protocols."""
+
+    async def _profile_key(self, profile_server, source_id: str) -> tuple:
+        raw_key, info = await profile_server.db.create_api_key(
+            name=f"key-{source_id}", primary_device_id=source_id
+        )
+        return raw_key, info
+
+    async def test_entropy_service_serves_profile_id(self, profile_server, profile_address):
+        raw_key, info = await self._profile_key(profile_server, "qq-mock")
+        nonce = 0x7FEDCBA987654321
+        async with grpc.aio.insecure_channel(profile_address) as channel:
+            stub = entropy_service_pb2_grpc.EntropyServiceStub(channel)
+            reply = await stub.GetEntropy(
+                entropy_service_pb2.EntropyRequest(bytes_needed=64, sequence_id=nonce),
+                metadata=(("api-key", raw_key),),
+            )
+        assert len(reply.data) == 64  # never empty on success
+        assert reply.sequence_id == nonce  # echo survives the profile path
+        assert reply.device_id == "qq-mock"  # device_id = the PROFILE id
+        assert reply.generation_timestamp_ns > 0
+
+        # One provenance record, kind fields present (spec §13 grpcurl item).
+        import json
+        from pathlib import Path
+
+        lines = Path(profile_server.config.provenance.path).read_text().splitlines()
+        record = json.loads(lines[-1])
+        assert record["source_id"] == "qq-mock"
+        assert record["protocol"] == "qr_entropy"
+        assert record["sequence_id"] == nonce
+        assert record["api_key_id"] == info["id"]
+        assert [f["kind"] for f in record["inputs"]] == ["mock", "mock"]
+        assert record["max_pair_skew_ns"] >= 0
+
+    async def test_qrng_protocol_serves_profile_id(self, profile_server, profile_address):
+        raw_key, _ = await self._profile_key(profile_server, "pp-match")
+        async with grpc.aio.insecure_channel(profile_address) as channel:
+            stub = qrng_pb2_grpc.QuantumRNGStub(channel)
+            reply = await stub.GetRandomBytes(
+                qrng_pb2.RandomRequest(num_bytes=32), metadata=(("api-key", raw_key),)
+            )
+        assert len(reply.data) == 32
+        assert reply.device_id == "pp-match"  # profile id on BOTH protocols
+
+    async def test_key_bound_to_control_id(self, profile_server, profile_address):
+        raw_key, _ = await self._profile_key(profile_server, "prng-a")
+        async with grpc.aio.insecure_channel(profile_address) as channel:
+            stub = qrng_pb2_grpc.QuantumRNGStub(channel)
+            reply = await stub.GetRandomBytes(
+                qrng_pb2.RandomRequest(num_bytes=16), metadata=(("api-key", raw_key),)
+            )
+        assert reply.device_id == "prng-a"
+
+    async def test_profile_with_downed_input_is_unavailable(
+        self, profile_server, profile_address
+    ):
+        from qbert0g.devices import DeviceStatus
+
+        raw_key, _ = await self._profile_key(profile_server, "qq-mock")
+        profile_server.devices.devices["mock-1"].status = DeviceStatus.ERROR
+        try:
+            async with grpc.aio.insecure_channel(profile_address) as channel:
+                stub = entropy_service_pb2_grpc.EntropyServiceStub(channel)
+                with pytest.raises(grpc.aio.AioRpcError) as exc_info:
+                    await stub.GetEntropy(
+                        entropy_service_pb2.EntropyRequest(bytes_needed=8),
+                        metadata=(("api-key", raw_key),),
+                    )
+            assert exc_info.value.code() == grpc.StatusCode.UNAVAILABLE
+        finally:
+            profile_server.devices.devices["mock-1"].status = DeviceStatus.ONLINE
+
+    async def test_plain_device_request_also_gets_provenance(self, profile_server, profile_address):
+        """Plain devices are sources too — every served request is recorded."""
+        import json
+        from pathlib import Path
+
+        async with grpc.aio.insecure_channel(profile_address) as channel:
+            stub = qrng_pb2_grpc.QuantumRNGStub(channel)
+            await stub.GetRandomBytes(
+                qrng_pb2.RandomRequest(num_bytes=8), metadata=METADATA
+            )
+        lines = Path(profile_server.config.provenance.path).read_text().splitlines()
+        record = json.loads(lines[-1])
+        assert record["source_id"] == "mock-0"  # admin key "*" -> first device
+        assert record["transform"] is None
+        assert record["protocol"] == "qrng"
+
+
 class TestFreshnessConfig:
     async def test_timestamps_zero_when_emission_disabled(self, tmp_path):
         from conftest import make_config

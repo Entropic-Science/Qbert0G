@@ -35,6 +35,7 @@ from .database import Database
 from .devices import DeviceManager
 from .gate import RequestGate
 from .proto import entropy_service_pb2, entropy_service_pb2_grpc, qrng_pb2, qrng_pb2_grpc
+from .sources import SourceRouter
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ class QuantumRNGServicer(qrng_pb2_grpc.QuantumRNGServicer):
     async def GetRandomBytes(
         self, request: qrng_pb2.RandomRequest, context: grpc.aio.ServicerContext
     ) -> qrng_pb2.RandomResponse:
-        m = await self._gate.measure(context, request.num_bytes)
+        m = await self._gate.measure(context, request.num_bytes, protocol="qrng")
         return qrng_pb2.RandomResponse(
             data=m.data,
             timestamp=m.timestamp_ns // 1_000,  # epoch microseconds
@@ -72,7 +73,9 @@ class EntropyServicer(entropy_service_pb2_grpc.EntropyServiceServicer):
         request: entropy_service_pb2.EntropyRequest,
         context: grpc.aio.ServicerContext,
     ) -> entropy_service_pb2.EntropyResponse:
-        m = await self._gate.measure(context, request.bytes_needed)
+        m = await self._gate.measure(
+            context, request.bytes_needed, protocol="qr_entropy", sequence_id=request.sequence_id
+        )
         return entropy_service_pb2.EntropyResponse(
             data=m.data,
             sequence_id=request.sequence_id,
@@ -89,7 +92,12 @@ class EntropyServicer(entropy_service_pb2_grpc.EntropyServiceServicer):
         unary call.
         """
         async for request in request_iterator:
-            m = await self._gate.measure(context, request.bytes_needed)
+            m = await self._gate.measure(
+                context,
+                request.bytes_needed,
+                protocol="qr_entropy",
+                sequence_id=request.sequence_id,
+            )
             yield entropy_service_pb2.EntropyResponse(
                 data=m.data,
                 sequence_id=request.sequence_id,
@@ -109,6 +117,7 @@ class QbertServer:
         self.config = config
         self.db = Database(config.database_path)
         self.devices = DeviceManager(config)
+        self.router: SourceRouter | None = None  # built in start() (controls need model files)
         self.port: int | None = None  # actual TCP port after start()
         self._server: aio.Server | None = None
 
@@ -122,13 +131,23 @@ class QbertServer:
         await self.devices.initialize()
         logger.info("Initialized %d device(s)", len(self.devices.devices))
 
+        # Fails loudly on a broken control (e.g. missing Markov model):
+        # never start serving with a silently absent experiment arm.
+        self.router = SourceRouter(config, self.devices)
+        logger.info(
+            "Source namespace: %d device(s), %d control(s), %d profile(s)",
+            len(self.devices.devices),
+            len(config.controls),
+            len(config.profiles),
+        )
+
         server = aio.server(
             options=[
                 ("grpc.max_send_message_length", config.server.max_message_size),
                 ("grpc.max_receive_message_length", config.server.max_message_size),
             ]
         )
-        gate = RequestGate(config, self.db, self.devices)
+        gate = RequestGate(config, self.db, self.router)
         qrng_pb2_grpc.add_QuantumRNGServicer_to_server(QuantumRNGServicer(gate), server)
         entropy_service_pb2_grpc.add_EntropyServiceServicer_to_server(
             EntropyServicer(gate), server
