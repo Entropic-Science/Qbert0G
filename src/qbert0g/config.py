@@ -178,6 +178,19 @@ class ProfilesDefaultsConfig:
 
 
 @dataclass
+class ProvenanceConfig:
+    """The append-only per-request provenance JSONL (see sources.py).
+
+    ``strict: false`` (default): a provenance write failure logs ERROR
+    and the request is still served. ``strict: true`` inverts that for
+    study runs — a request whose provenance cannot be recorded fails.
+    """
+
+    path: str = "./provenance.jsonl"
+    strict: bool = False
+
+
+@dataclass
 class Config:
     """Root configuration object."""
 
@@ -190,6 +203,7 @@ class Config:
     controls: list[ControlConfig] = field(default_factory=list)
     profiles: list[ProfileConfig] = field(default_factory=list)
     profiles_defaults: ProfilesDefaultsConfig = field(default_factory=ProfilesDefaultsConfig)
+    provenance: ProvenanceConfig = field(default_factory=ProvenanceConfig)
     database_path: str = "./qbert0g.db"
 
     def qcc_mode_for(self, device: DeviceConfig) -> int:
@@ -231,6 +245,7 @@ class Config:
                 "controls",
                 "profiles",
                 "profiles_defaults",
+                "provenance",
                 "database",
             },
         )
@@ -374,6 +389,15 @@ class Config:
         profiles = _parse_profiles(data.get("profiles", []) or [], seen_ids)
         profiles_defaults = _parse_profiles_defaults(data.get("profiles_defaults", {}) or {})
 
+        prov = data.get("provenance", {}) or {}
+        _check_keys("provenance", prov, {"path", "strict"})
+        provenance = ProvenanceConfig(
+            path=str(prov.get("path", "./provenance.jsonl")),
+            strict=bool(prov.get("strict", False)),
+        )
+        if not provenance.path:
+            raise ConfigError("provenance: `path` must not be empty")
+
         db = data.get("database", {}) or {}
         _check_keys("database", db, {"path"})
 
@@ -387,6 +411,7 @@ class Config:
             controls=controls,
             profiles=profiles,
             profiles_defaults=profiles_defaults,
+            provenance=provenance,
             database_path=str(db.get("path", "./qbert0g.db")),
         )
 

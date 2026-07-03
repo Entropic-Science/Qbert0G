@@ -372,6 +372,28 @@ class TestProfilesDefaults:
             Config.from_dict(_minimal(profiles_defaults={"max_skew_ns": -1}))
 
 
+class TestProvenance:
+    def test_defaults(self):
+        config = Config.from_dict(_minimal())
+        assert config.provenance.path == "./provenance.jsonl"
+        assert config.provenance.strict is False
+
+    def test_overrides(self):
+        config = Config.from_dict(
+            _minimal(provenance={"path": "/var/log/qbert0g/prov.jsonl", "strict": True})
+        )
+        assert config.provenance.path == "/var/log/qbert0g/prov.jsonl"
+        assert config.provenance.strict is True
+
+    def test_unknown_key_rejected(self):
+        with pytest.raises(ConfigError, match="unknown key"):
+            Config.from_dict(_minimal(provenance={"file": "x.jsonl"}))
+
+    def test_empty_path_rejected(self):
+        with pytest.raises(ConfigError, match="path"):
+            Config.from_dict(_minimal(provenance={"path": ""}))
+
+
 class TestExampleConfig:
     def test_shipped_example_parses(self):
         from pathlib import Path

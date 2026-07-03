@@ -475,6 +475,55 @@ class DeviceManager:
         order += [dev_id for dev_id in self.devices if dev_id not in order]
         return order
 
+    @contextlib.asynccontextmanager
+    async def acquire_for_profile(self, device_id: str) -> Any:
+        """Hold ONE device exclusively for a profile read (SourceRouter seam).
+
+        Profiles never fail over, so this waits on the named device's
+        lock (no skipping to siblings), marks it BUSY, ensures it is
+        connected/streaming, and runs the pre-measurement freshness seam
+        (:meth:`_flush_input`) exactly ONCE. Chunk reads inside the
+        context go through :meth:`read_chunk_locked`, which skips the
+        per-read flush — for paired profile reads freshness is per
+        REQUEST, not per chunk (spec: flush once at request start).
+        """
+        state = self.devices.get(device_id)
+        if state is None or state.status not in (DeviceStatus.ONLINE, DeviceStatus.BUSY):
+            raise RuntimeError(f"Device {device_id} is not available")
+        async with state.lock:
+            state.status = DeviceStatus.BUSY
+            try:
+                if state.driver is None:
+                    await self._connect_device(device_id)
+                if state.config.streaming_mode and not state.streaming_active:
+                    await self._start_streaming(device_id)
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(self._executor, self._flush_input, state)
+                yield state
+                state.requests_served += 1
+                state.last_request_time = time.time()
+            finally:
+                if state.status == DeviceStatus.BUSY:
+                    state.status = DeviceStatus.ONLINE
+
+    async def read_chunk_locked(self, device_id: str, num_bytes: int) -> bytes:
+        """One raw chunk WITHOUT the freshness flush (SourceRouter seam).
+
+        The caller must hold the device via :meth:`acquire_for_profile`
+        (which already flushed once at request start). Read errors mark
+        the device ERROR exactly like :meth:`read_bytes` does.
+        """
+        state = self.devices[device_id]
+        try:
+            data = await self._read_from_device(device_id, num_bytes, flush=False)
+        except Exception as exc:
+            state.status = DeviceStatus.ERROR
+            state.error_message = str(exc)
+            logger.error("Device %s read error: %s", device_id, exc)
+            raise
+        state.bytes_served += num_bytes
+        return data
+
     async def read_bytes(
         self, primary_device_id: str, num_bytes: int, timeout: float = 5.0
     ) -> tuple[bytes, str]:
@@ -517,8 +566,15 @@ class DeviceManager:
 
         raise TimeoutError(f"No device available within {timeout} seconds")
 
-    async def _read_from_device(self, device_id: str, num_bytes: int) -> bytes:
-        """Read while holding the device lock; reconnects if needed."""
+    async def _read_from_device(
+        self, device_id: str, num_bytes: int, *, flush: bool = True
+    ) -> bytes:
+        """Read while holding the device lock; reconnects if needed.
+
+        ``flush=False`` skips the pre-read freshness seam — used only by
+        :meth:`read_chunk_locked`, where :meth:`acquire_for_profile`
+        already flushed once at the start of the profile request.
+        """
         state = self.devices[device_id]
 
         if state.driver is None:
@@ -530,15 +586,16 @@ class DeviceManager:
             if not state.streaming_active:
                 await self._start_streaming(device_id)
                 logger.info("Device %s waking from sleep mode", device_id)
-            return await self._read_streaming(device_id, num_bytes)
+            return await self._read_streaming(device_id, num_bytes, flush=flush)
 
         if num_bytes > state.oneshot_limit:
-            return await self._read_large_continuous(device_id, num_bytes)
+            return await self._read_large_continuous(device_id, num_bytes, flush=flush)
 
         loop = asyncio.get_running_loop()
 
         def _read_oneshot() -> bytes:
-            self._flush_input(state)  # freshness: nothing pre-request survives
+            if flush:
+                self._flush_input(state)  # freshness: nothing pre-request survives
             data = state.driver.start_one_shot(num_bytes)
             if not data:
                 raise RuntimeError("Device returned no data")
@@ -548,12 +605,15 @@ class DeviceManager:
         self._check_length(device_id, data, num_bytes)
         return data
 
-    async def _read_streaming(self, device_id: str, num_bytes: int) -> bytes:
+    async def _read_streaming(
+        self, device_id: str, num_bytes: int, *, flush: bool = True
+    ) -> bytes:
         state = self.devices[device_id]
         loop = asyncio.get_running_loop()
 
         def _do_read() -> bytes:
-            self._flush_input(state)
+            if flush:
+                self._flush_input(state)
             data = state.driver.read_continuous(num_bytes)
             if not data:
                 raise RuntimeError("Device returned no data in streaming mode")
@@ -563,13 +623,16 @@ class DeviceManager:
         self._check_length(device_id, data, num_bytes)
         return data
 
-    async def _read_large_continuous(self, device_id: str, num_bytes: int) -> bytes:
+    async def _read_large_continuous(
+        self, device_id: str, num_bytes: int, *, flush: bool = True
+    ) -> bytes:
         """Serve an over-one-shot-limit request via a temporary burst."""
         state = self.devices[device_id]
         loop = asyncio.get_running_loop()
 
         def _read_continuous() -> bytes:
-            self._flush_input(state)
+            if flush:
+                self._flush_input(state)
             if not state.driver.start_continuous():
                 raise RuntimeError("Failed to start continuous mode")
             try:
