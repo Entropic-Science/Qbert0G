@@ -1,7 +1,7 @@
 # Qbert0G — agent guide
 
-gRPC daemon serving freshly measured quantum noise. Two services, one process,
-one shared request pipeline. ~2k LOC, no framework magic.
+gRPC daemon serving freshly measured quantum noise. Three services, one
+process, one shared request pipeline. No framework magic.
 
 ## Verification oracles (run these; treat output as ground truth)
 
@@ -17,12 +17,21 @@ Or `make check`. A change is not done until both pass.
 ```
 cli.py  ──►  server.py  ──►  gate.py  ──►  sources.py (SourceRouter)
                  │               │             ├──► profiles.py  (transforms)
-                 └──► proto/     │             ├──► controls.py  (PRNG sources)
-                                 │             └──► devices.py
-                                 └──► database.py
+                 ├──► proto/     │             ├──► controls.py  (PRNG sources)
+                 │               │             └──► devices.py
+                 │               └──► database.py
+                 ├──► coherence.py ──► sources.py   (CoherenceMonitor)
+                 ├──► integrators.py ──► fingerprint.py
+                 └──► purity.py      ──► fingerprint.py
 all of the above ──► config.py   (config.py imports nothing internal;
-                                  profiles.py/controls.py import ONLY config.py)
+                                  profiles.py/controls.py/fingerprint.py
+                                  import ONLY config.py)
 ```
+
+The QPI modules (`coherence.py` / `integrators.py` / `purity.py` /
+`fingerprint.py`) are drawn under `server.py`, but `cli.py` also imports
+them directly for the offline commands (`draws pull`, `coherence null`,
+`sources describe`) — those edges still point strictly downward.
 
 - `config.py` — strict schema; **unknown keys are a startup error**. All
   tunables live here; no other module reads YAML or env vars.
@@ -48,24 +57,38 @@ all of the above ──► config.py   (config.py imports nothing internal;
   chunks, skew measurement); `ProvenanceLog` (append-only JSONL, one record
   per served request); `watch_read` (raw device samples for the CLI
   `sources watch` bitstream viewer, through the same paired-read path).
-- `gate.py` — `RequestGate.measure(context, n, protocol=..., sequence_id=...)`:
+- `fingerprint.py` — frozen per-source statistical baselines (QPI):
+  `load_fingerprint(path) -> (Fingerprint, sha256)`, loud validation incl. a
+  neff-vs-ACF cross-check. Fitted offline by `scripts/fit_fingerprint.py`.
+- `integrators.py` — pure integration statistics `integrate(name, raw, fp)
+  -> IntegrationResult(z, u, aux)`; the name sets (`INTEGRATOR_TYPES` /
+  `SERVE_INTEGRATORS` / `AUX_INTEGRATORS`) live in `config.py`.
+- `purity.py` — the purity taxonomy (`Origin`/`Integrity`/`Processing`),
+  `EntropyLabel` with canonical round-trip, static label derivation.
+- `coherence.py` — pure `block_correlation` (lag-scanned Pearson r, Fisher
+  z_c) + `CoherenceMonitor` (background device-pair evaluation loop; reads
+  via `SourceRouter.coherence_pair_read`).
+- `gate.py` — `RequestGate.measure(context, n, protocol=..., sequence_id=...,
+  requested_source_id=..., provenance_extras=...)`:
   auth → rate limit → byte caps → source read → provenance → usage record.
-  **Every RPC of both services goes through this one method**; never add a
-  second validation path. API keys bind to ANY source id.
-- `server.py` — the two servicers + `QbertServer` (testable start/stop) +
-  `serve()` (signals). Binds TCP and/or UDS.
-- `proto/` — `qrng.proto` (public) + `entropy_service.proto` (byte-identical
-  copy of qr-sampler's proto). Generated stubs are committed; regenerate with
-  `make proto`.
+  **Every RPC of all three services goes through this one method**; never add
+  a second validation path. API keys bind to ANY source id.
+- `server.py` — the three servicers + `QpiContext` composition +
+  `QbertServer` (testable start/stop) + `serve()` (signals). Binds TCP
+  and/or UDS.
+- `proto/` — `qrng.proto` (public), `entropy_service.proto` and
+  `purity_service.proto` (byte-identical copies of qr-sampler's protos).
+  Generated stubs are committed; regenerate with `make proto` (its file list
+  must name all three .proto files; regeneration must be a no-op diff).
 
-## The two protocols (do not break these invariants)
+## The three protocols (do not break these invariants)
 
-| | `qrng.QuantumRNG` | `qr_entropy.EntropyService` |
-|---|---|---|
-| consumers | general public clients | qr-sampler / qthought |
-| request | `num_bytes` (field 1) | `bytes_needed` (1), `sequence_id` (2) |
-| response | `data` (1), `timestamp` µs (2), `device_id` (3) | `data` (1), `sequence_id` echo (2), `generation_timestamp_ns` (3), `device_id` (4) |
-| RPCs | `GetRandomBytes` | `GetEntropy` + `StreamEntropy` (bidi) |
+| | `qrng.QuantumRNG` | `qr_entropy.EntropyService` | `qr_purity.PurityService` |
+|---|---|---|---|
+| consumers | general public clients | qr-sampler / qthought | qr-sampler server-draw mode |
+| request | `num_bytes` (field 1) | `bytes_needed` (1), `sequence_id` (2) | `sequence_id` (1), `source_id` (2), `block_bytes` (3) |
+| response | `data` (1), `timestamp` µs (2), `device_id` (3) | `data` (1), `sequence_id` echo (2), `generation_timestamp_ns` (3), `device_id` (4) | `u` (1), `z` (2), `sequence_id` echo (3), `generation_timestamp_ns` (4), `source_id` (5), `coherence_z` (6), `coherence_valid` (7), `purity_label` (8), `integrated_bytes` (9), `integrator` (10), `coherence_r` (11) |
+| RPCs | `GetRandomBytes` | `GetEntropy` + `StreamEntropy` (bidi) | `GetDraw` + `StreamDraws` (bidi) |
 
 Load-bearing details:
 
@@ -96,7 +119,29 @@ Load-bearing details:
    output** — matched-distribution PRNG controls are legitimately
    non-uniform. The pipeline proof is provenance replay: regenerate a served
    block offline from its record alone and assert byte identity. Statistical
-   assertions live ONLY in transform unit tests against constructed inputs.
+   assertions live ONLY in transform unit tests against constructed inputs
+   (this explicitly includes the QPI integrator/coherence tests: KS-uniformity
+   and null pins run on synthetic/mock data at the transform level).
+9. **Fingerprints are frozen at load.** No runtime baseline adaptation — a
+   drifting baseline absorbs exactly the sustained signal the integrators
+   exist to see. `load_fingerprint` refuses silently edited files (neff-vs-ACF
+   cross-check); re-characterization is an operator action between runs.
+10. **`coherence_valid` is never faked.** Monitor absent, disabled, stale
+    (`max_age_s`), or never computed ⇒ `coherence_valid=false` on the draw —
+    never a fabricated zero. A failed evaluation leaves the last value as-is;
+    staleness is what downgrades it.
+11. **The serve path refuses non-serve integrators.** Only `SERVE_INTEGRATORS`
+    (`bit_z`, `byte_z`) may produce a served `u`; `default_integrator` outside
+    that set is a startup `ConfigError`. Aux (`cusum`, `rw_excursion`) are
+    provenance-only secondaries; `majority_vote`/`kmer_mode` are offline/CLI
+    statistics. Nobody samples tokens off a mode statistic.
+12. **One validation path includes the PurityService.** Every draw goes
+    through `RequestGate.measure` (`protocol="qr_purity"`, `block_bytes`
+    accounted) and produces exactly one provenance record, carrying the draw
+    extras (`integrator`, `z`, `purity_label`, `fingerprint_sha256`,
+    `coherence`). `requested_source_id` is honored only for draws and only
+    for ids in `integration.sources`. Success responses never carry `u`
+    outside `(1e-10, 1 - 1e-10)`; `sequence_id` is echoed verbatim.
 
 ## How to extend
 
@@ -121,6 +166,16 @@ Load-bearing details:
   `make_control` + `config.py:CONTROL_TYPES`. Keep it seeded and offline-
   regenerable — record whatever facts regeneration needs in the provenance
   fact (see `SourceRouter._control_bytes`).
+- **New integrator**: pure function `(raw: bytes, fp: Fingerprint) ->
+  IntegrationResult` in `integrators.py` + an entry in its `_INTEGRATORS`
+  dispatch dict + the name added to `config.py:INTEGRATOR_TYPES` (the module
+  asserts the two stay in sync). Then decide its class deliberately:
+  `SERVE_INTEGRATORS` only if its `u` is honestly uniform under the null
+  (fingerprint-referenced, Φ-mapped, clamped); `AUX_INTEGRATORS` if it is a
+  provenance-only secondary; neither for offline/CLI statistics. Reference
+  every parameter to the fingerprint, never to ideal values; correct standard
+  errors with `fp.neff_factor`. Add golden hand-computed vectors to
+  `tests/test_integrators.py`.
 
 ## Cross-repo context
 
@@ -130,9 +185,14 @@ Load-bearing details:
   deployment docs live in `qr-llm-qthought/docs/` (`SETUP_GUIDE.md`,
   `SECRETS_MAP.md`) and its `infra/qthought-qbert0g.service` runs this daemon
   as `qbert0g serve --config /etc/qthought/qbert0g.config.yaml`.
-- `entropy_service.proto` is a copy of
-  `qr-sampler/src/qr_sampler/proto/entropy_service.proto`. If it ever changes
-  upstream (it is deliberately frozen), copy it here and `make proto`.
+- `entropy_service.proto` and `purity_service.proto` are byte-identical
+  copies of qr-sampler's protos (`entropy_service.proto` is deliberately
+  frozen). Byte-identity of `purity_service.proto` is enforced by the SAME
+  pinned sha256 constant in both repos' tests
+  (`tests/test_purity_service.py::TestProtoPin` here). If a proto changes,
+  update BOTH repos + BOTH pins in one increment, and run `make proto` —
+  the Makefile `proto` target's file list must name all three .proto files,
+  and regeneration must produce a no-op diff on committed stubs.
 - The seam tests skip without qr-sampler; install it editable
   (`pip install -e ../qr-sampler`) to run the full contract.
 

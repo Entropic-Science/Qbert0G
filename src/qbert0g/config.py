@@ -52,6 +52,30 @@ CONTROL_TYPES = frozenset({"prng_uniform", "prng_markov"})
 #: deliberately out of scope for v1 — new arities would be added here.
 TRANSFORM_ARITY = {"identity": 1, "xnor": 2, "parity": 1}
 
+#: All integrator statistics implemented in integrators.py. The name→
+#: implementation dispatch lives THERE; the name sets live HERE so config
+#: validation and the statistics library share one source of truth
+#: (the CONTROL_TYPES / TRANSFORM_ARITY pattern).
+INTEGRATOR_TYPES = frozenset(
+    {"bit_z", "byte_z", "cusum", "rw_excursion", "majority_vote", "kmer_mode"}
+)
+
+#: Integrators allowed to produce the served ``u`` on the PurityService
+#: draw path. Everything else is refused at startup / INVALID_ARGUMENT —
+#: nobody samples tokens off a mode statistic.
+SERVE_INTEGRATORS = frozenset({"bit_z", "byte_z"})
+
+#: Auxiliary statistics computable alongside the primary
+#: (``integration.secondaries``). Provenance/CLI visibility only —
+#: their z/u fields are defined but never served.
+AUX_INTEGRATORS = frozenset({"cusum", "rw_excursion"})
+# majority_vote / kmer_mode: dispatch entries exist for offline CLI use
+# only; the serve path refuses them (they are in neither set above).
+
+#: Quantum-fraction tiers a fingerprint may declare. Devices ship
+#: ``unrated`` until a characterization supplies a value.
+QF_TIERS = frozenset({"99+", "98+", "95+", "90+", "unrated"})
+
 #: PRNG seeds are exactly 128 bits: ``0x`` + 32 hex digits. Required —
 #: there is no silent time-seeding (a control must be regenerable).
 _SEED_RE = re.compile(r"^0x[0-9a-fA-F]{32}$")
@@ -130,6 +154,7 @@ class DeviceConfig:
     rate_mbit_s: float | None = None  # informational (capacity notes)
     post_processing: str | None = None  # per-device override of the global mode
     pci_address: str | None = None  # chardev only; enables freshness flush + health
+    fingerprint: str = ""  # per-device fingerprint JSON path (QPI draws)
 
 
 @dataclass
@@ -148,6 +173,7 @@ class ControlConfig:
     type: str  # prng_uniform | prng_markov
     seed: str  # 128-bit hex, "0x" + 32 hex digits; REQUIRED
     model: str = ""  # npz model path; prng_markov only
+    fingerprint: str = ""  # fingerprint JSON path (QPI draws on a control)
 
     @property
     def seed_int(self) -> int:
@@ -193,6 +219,49 @@ class ProvenanceConfig:
 
 
 @dataclass
+class IntegrationConfig:
+    """Server-side integration (QPI draws over the PurityService).
+
+    ``sources`` is the allowlist of ids drawable via ``GetDraw`` — each
+    must be a configured device or control whose entry declares a
+    ``fingerprint:`` path (checked structurally at config parse; the
+    file itself must load and validate at server startup — see
+    fingerprint.py — mirroring the prng_markov ``model`` precedent so
+    the config stays checkable on machines without the files).
+    ``default_integrator`` must be a serve-path integrator: aux/offline
+    statistics never produce a served ``u``.
+    """
+
+    block_bytes: int = 2_097_152  # 2 MiB per draw (z ≈ 8192·δ sensitivity)
+    default_integrator: str = "bit_z"
+    secondaries: list[str] = field(default_factory=list)  # subset of AUX_INTEGRATORS
+    sources: list[str] = field(default_factory=list)  # ids drawable via PurityService
+
+
+@dataclass
+class CoherenceConfig:
+    """Background device-pair block-correlation monitor (coherence.py)."""
+
+    enabled: bool = False
+    pair: list[str] = field(default_factory=list)  # exactly 2 device ids when enabled
+    block_bytes: int = 1024  # ones-fraction reduction block size
+    blocks_per_side: int = 32  # blocks read per device per evaluation
+    lag_scan_blocks: int = 4  # Pearson r scanned at lags in [-N, +N]
+    min_valid_blocks: int = 24  # k_eff below this ⇒ evaluation invalid
+    refresh_s: float = 1.0  # evaluation cadence
+    max_age_s: float = 5.0  # staleness bound: older values serve coherence_valid=false
+    null_ref: str | None = None  # `coherence null` output path (informational)
+    null_pair: list[str] = field(default_factory=list)  # 2 prng control ids for the null
+
+
+@dataclass
+class PurityConfig:
+    """Purity-taxonomy serve-time knobs (purity.py)."""
+
+    verify_sigma: float = 6.0  # |z| tolerance for the quantum_verified bit
+
+
+@dataclass
 class Config:
     """Root configuration object."""
 
@@ -207,6 +276,9 @@ class Config:
     profiles_defaults: ProfilesDefaultsConfig = field(default_factory=ProfilesDefaultsConfig)
     provenance: ProvenanceConfig = field(default_factory=ProvenanceConfig)
     database_path: str = "./qbert0g.db"
+    integration: IntegrationConfig = field(default_factory=IntegrationConfig)
+    coherence: CoherenceConfig = field(default_factory=CoherenceConfig)
+    purity: PurityConfig = field(default_factory=PurityConfig)
 
     def qcc_mode_for(self, device: DeviceConfig) -> int:
         """The qcc-cli ``-P`` integer for *device* (override or global)."""
@@ -249,6 +321,9 @@ class Config:
                 "profiles_defaults",
                 "provenance",
                 "database",
+                "integration",
+                "coherence",
+                "purity",
             },
         )
 
@@ -335,6 +410,7 @@ class Config:
                     "rate_mbit_s",
                     "post_processing",
                     "pci_address",
+                    "fingerprint",
                 },
             )
             if "id" not in dev or "type" not in dev:
@@ -382,6 +458,7 @@ class Config:
                     pci_address=(
                         str(dev["pci_address"]) if dev.get("pci_address") is not None else None
                     ),
+                    fingerprint=str(dev.get("fingerprint", "") or ""),
                 )
             )
 
@@ -403,6 +480,14 @@ class Config:
         db = data.get("database", {}) or {}
         _check_keys("database", db, {"path"})
 
+        integration = _parse_integration(
+            data.get("integration", {}) or {}, devices=devices, controls=controls
+        )
+        coherence = _parse_coherence(
+            data.get("coherence", {}) or {}, devices=devices, controls=controls
+        )
+        purity = _parse_purity(data.get("purity", {}) or {})
+
         return cls(
             server=server,
             auth=auth,
@@ -415,6 +500,9 @@ class Config:
             profiles_defaults=profiles_defaults,
             provenance=provenance,
             database_path=str(db.get("path", "./qbert0g.db")),
+            integration=integration,
+            coherence=coherence,
+            purity=purity,
         )
 
 
@@ -423,7 +511,7 @@ def _parse_controls(entries: list, seen_ids: set[str]) -> list[ControlConfig]:
     controls: list[ControlConfig] = []
     for ctl in entries:
         section = f"controls[{ctl.get('id', '?')}]"
-        _check_keys(section, ctl, {"id", "type", "seed", "model"})
+        _check_keys(section, ctl, {"id", "type", "seed", "model", "fingerprint"})
         if "id" not in ctl or "type" not in ctl:
             raise ConfigError("controls: every control needs `id` and `type`")
         if ctl["type"] not in CONTROL_TYPES:
@@ -453,6 +541,7 @@ def _parse_controls(entries: list, seen_ids: set[str]) -> list[ControlConfig]:
                 type=str(ctl["type"]),
                 seed=str(seed),
                 model=str(ctl.get("model", "")),
+                fingerprint=str(ctl.get("fingerprint", "") or ""),
             )
         )
     return controls
@@ -560,6 +649,152 @@ def _parse_parity_params(section: str, params: dict) -> tuple[tuple[int, ...], i
                         "`params.allow_period4: true` if this is deliberate"
                     )
     return taps, stride, allow_period4
+
+
+def _parse_integration(
+    data: dict, *, devices: list[DeviceConfig], controls: list[ControlConfig]
+) -> IntegrationConfig:
+    """Validate the ``integration:`` section (QPI draw serving).
+
+    Startup rule (FR-Q3): every id in ``sources`` must name a configured
+    device or control whose entry declares ``fingerprint:`` — no silent
+    ideal-value defaults. The fingerprint FILE is loaded and validated
+    at server startup (fingerprint.load_config_fingerprints), not here,
+    so the config stays checkable on machines without the files.
+    Profiles are not drawable in this iteration.
+    """
+    _check_keys(
+        "integration", data, {"block_bytes", "default_integrator", "secondaries", "sources"}
+    )
+    integration = IntegrationConfig(
+        block_bytes=int(data.get("block_bytes", 2_097_152)),
+        default_integrator=str(data.get("default_integrator", "bit_z")),
+        secondaries=[str(s) for s in data.get("secondaries", []) or []],
+        sources=[str(s) for s in data.get("sources", []) or []],
+    )
+    if integration.block_bytes < 1:
+        raise ConfigError("integration: `block_bytes` must be >= 1")
+    if integration.default_integrator not in INTEGRATOR_TYPES:
+        raise ConfigError(
+            f"integration: default_integrator must be one of {sorted(INTEGRATOR_TYPES)}, "
+            f"got {integration.default_integrator!r}"
+        )
+    if integration.default_integrator not in SERVE_INTEGRATORS:
+        raise ConfigError(
+            f"integration: default_integrator {integration.default_integrator!r} is not a "
+            f"serve-path integrator (allowed: {sorted(SERVE_INTEGRATORS)}) — aux/offline "
+            "statistics never produce a served u"
+        )
+    for name in integration.secondaries:
+        if name not in AUX_INTEGRATORS:
+            raise ConfigError(
+                f"integration: secondaries entry {name!r} must be one of "
+                f"{sorted(AUX_INTEGRATORS)} (aux statistics only)"
+            )
+    fingerprint_by_id = {d.id: d.fingerprint for d in devices}
+    fingerprint_by_id.update({c.id: c.fingerprint for c in controls})
+    seen_sources: set[str] = set()
+    for source_id in integration.sources:
+        if source_id in seen_sources:
+            raise ConfigError(f"integration: duplicate sources entry {source_id!r}")
+        seen_sources.add(source_id)
+        if source_id not in fingerprint_by_id:
+            raise ConfigError(
+                f"integration: sources entry {source_id!r} is not a configured device "
+                "or control (profiles are not drawable in this iteration)"
+            )
+        if not fingerprint_by_id[source_id]:
+            raise ConfigError(
+                f"integration: sources entry {source_id!r} has no `fingerprint:` path — "
+                "a drawable source REQUIRES a fitted fingerprint "
+                "(scripts/fit_fingerprint.py); there are no silent ideal-value defaults"
+            )
+    return integration
+
+
+def _parse_coherence(
+    data: dict, *, devices: list[DeviceConfig], controls: list[ControlConfig]
+) -> CoherenceConfig:
+    """Validate the ``coherence:`` section (device-pair monitor)."""
+    _check_keys(
+        "coherence",
+        data,
+        {
+            "enabled",
+            "pair",
+            "block_bytes",
+            "blocks_per_side",
+            "lag_scan_blocks",
+            "min_valid_blocks",
+            "refresh_s",
+            "max_age_s",
+            "null_ref",
+            "null_pair",
+        },
+    )
+    null_ref = data.get("null_ref")
+    coherence = CoherenceConfig(
+        enabled=bool(data.get("enabled", False)),
+        pair=[str(p) for p in data.get("pair", []) or []],
+        block_bytes=int(data.get("block_bytes", 1024)),
+        blocks_per_side=int(data.get("blocks_per_side", 32)),
+        lag_scan_blocks=int(data.get("lag_scan_blocks", 4)),
+        min_valid_blocks=int(data.get("min_valid_blocks", 24)),
+        refresh_s=float(data.get("refresh_s", 1.0)),
+        max_age_s=float(data.get("max_age_s", 5.0)),
+        null_ref=str(null_ref) if null_ref is not None else None,
+        null_pair=[str(p) for p in data.get("null_pair", []) or []],
+    )
+    if coherence.block_bytes < 1:
+        raise ConfigError("coherence: `block_bytes` must be >= 1")
+    if coherence.blocks_per_side < 1:
+        raise ConfigError("coherence: `blocks_per_side` must be >= 1")
+    if coherence.lag_scan_blocks < 0:
+        raise ConfigError("coherence: `lag_scan_blocks` must be >= 0")
+    if coherence.min_valid_blocks < 1:
+        raise ConfigError("coherence: `min_valid_blocks` must be >= 1")
+    if coherence.min_valid_blocks > coherence.blocks_per_side:
+        raise ConfigError(
+            "coherence: `min_valid_blocks` must be <= `blocks_per_side` "
+            "(no evaluation could ever be valid)"
+        )
+    if coherence.refresh_s <= 0:
+        raise ConfigError("coherence: `refresh_s` must be > 0")
+    if coherence.max_age_s <= 0:
+        raise ConfigError("coherence: `max_age_s` must be > 0")
+    device_ids = {d.id for d in devices}
+    if coherence.enabled:
+        if len(coherence.pair) != 2 or len(set(coherence.pair)) != 2:
+            raise ConfigError(
+                "coherence: `pair` must list exactly 2 distinct device ids when enabled"
+            )
+        for pair_id in coherence.pair:
+            if pair_id not in device_ids:
+                raise ConfigError(
+                    f"coherence: pair entry {pair_id!r} is not a configured device"
+                )
+    if coherence.null_pair:
+        if len(coherence.null_pair) != 2 or len(set(coherence.null_pair)) != 2:
+            raise ConfigError(
+                "coherence: `null_pair` must be empty or exactly 2 distinct control ids"
+            )
+        control_ids = {c.id for c in controls}
+        for null_id in coherence.null_pair:
+            if null_id not in control_ids:
+                raise ConfigError(
+                    f"coherence: null_pair entry {null_id!r} is not a configured control "
+                    "(the null distribution runs over PRNG controls only)"
+                )
+    return coherence
+
+
+def _parse_purity(data: dict) -> PurityConfig:
+    """Validate the ``purity:`` section."""
+    _check_keys("purity", data, {"verify_sigma"})
+    purity = PurityConfig(verify_sigma=float(data.get("verify_sigma", 6.0)))
+    if purity.verify_sigma <= 0:
+        raise ConfigError("purity: `verify_sigma` must be > 0")
+    return purity
 
 
 def _parse_profiles_defaults(pd: dict) -> ProfilesDefaultsConfig:

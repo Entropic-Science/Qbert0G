@@ -8,7 +8,8 @@ A gRPC service that streams **freshly measured quantum noise** from Crypta Labs 
 ## Features
 
 - **Fresh and exclusive data per request** — no pooling, buffering, or pre-generation; every byte is measured upon request and served exclusively to the requester. When `freshness.flush_device_buffer` is on (the default), the serial receive buffer is flushed immediately before **every** measurement, so no byte measured before the request is ever served.
-- **Two wire protocols on one server** — the public `qrng.QuantumRNG` service for general clients, plus the `qr_entropy.EntropyService` protocol consumed natively by [qr-sampler](https://github.com/Entropic-Science) (sequence-id echo, nanosecond generation timestamps, bidirectional streaming).
+- **Three wire protocols on one server** — the public `qrng.QuantumRNG` service for general clients, the `qr_entropy.EntropyService` protocol consumed natively by [qr-sampler](https://github.com/Entropic-Science) (sequence-id echo, nanosecond generation timestamps, bidirectional streaming), and the `qr_purity.PurityService` QPI draw protocol (server-side integration of a raw block into one uniform value, with purity labels and the live coherence statistic).
+- **The QPI layer** — per-source frozen statistical fingerprints, baseline-referenced integration statistics, a purity/integrity taxonomy on every draw, and a background cross-device coherence monitor. See [The QPI layer](#the-qpi-layer-purity-integrity-and-integrated-draws).
 - **Low latency and efficient on the wire** — gRPC over HTTP/2; optional UNIX-domain-socket binding for co-located clients.
 - **Per-request provenance** — responses carry `device_id` and a measurement timestamp so samples can be attributed and reproduced in datasets.
 - **Selectable post-processing** — `raw` (zero post-processing), `sha256`, or `raw_samples`, globally or per device.
@@ -22,14 +23,18 @@ A gRPC service that streams **freshly measured quantum noise** from Crypta Labs 
 flowchart TD
     A["General clients<br/>(any language)"] -- "qrng.QuantumRNG/GetRandomBytes" --> S["gRPC server<br/>(TCP and/or UNIX socket)"]
     B["qr-sampler / qthought<br/>(QuantumGrpcSource)"] -- "qr_entropy.EntropyService<br/>GetEntropy + StreamEntropy" --> S
+    P["qr-sampler server-draw mode"] -- "qr_purity.PurityService<br/>GetDraw + StreamDraws" --> S
     S --> G["RequestGate<br/>(auth, rate limits, byte caps, usage)"]
-    G --> D["DeviceManager<br/>(locking, failover, freshness flush)"]
+    G --> R["SourceRouter<br/>(devices + PRNG controls + profiles)"]
+    R --> D["DeviceManager<br/>(locking, failover, freshness flush)"]
     D --> Q1["Firefly / QCicada / Dragonfly<br/>(pyqcc)"]
     D --> Q2["mock (os.urandom, dev only)"]
     G --> DB[("SQLite<br/>API keys + usage")]
+    M["CoherenceMonitor<br/>(background device-pair correlation)"] --> R
+    G -. "integrate vs frozen fingerprint,<br/>label, coherence snapshot" .-> P
 ```
 
-Both services share one request pipeline: auth, rate limiting, byte caps, device routing and usage accounting are identical regardless of which protocol a client speaks.
+All services share one request pipeline: auth, rate limiting, byte caps, source routing and usage accounting are identical regardless of which protocol a client speaks.
 
 ## Quick start
 
@@ -58,7 +63,7 @@ devices:
     type: "mock"     # os.urandom — NOT quantum; development only
 ```
 
-## The two protocols
+## The three protocols
 
 ### `qrng.QuantumRNG` — the public service
 
@@ -110,7 +115,19 @@ source = QuantumGrpcSource(QRSamplerConfig(
 data = source.get_random_bytes(10_000)
 ```
 
-See `examples/client.py` for a runnable demo of both protocols, and `tests/test_qr_sampler_seam.py` for the full cross-repo contract (echo verification, bidi streaming, legacy path).
+See `examples/client.py` for a runnable demo of the byte protocols, and `tests/test_qr_sampler_seam.py` for the full cross-repo contract (echo verification, bidi streaming, legacy path).
+
+### `qr_purity.PurityService` — the QPI draw seam
+
+Instead of raw bytes, a *draw* returns one server-side **integrated** value: the server measures a fresh block (`integration.block_bytes`, default 2 MiB), reduces it to a baseline-referenced z-score against the source's frozen fingerprint, and maps it through the exact normal CDF to a uniform `u`.
+
+**Request (`DrawRequest`):** `sequence_id` (int64, echoed verbatim — same commitment-nonce contract as EntropyService), `source_id` (string; empty = the API key's binding; must be in `integration.sources`), `block_bytes` (int64; 0 = the config default).
+
+**Response (`DrawResponse`):** `u` (double, clamped to `(1e-10, 1-1e-10)` — never 0.0/1.0 on success), `z` (double), `sequence_id`, `generation_timestamp_ns`, `source_id`, `coherence_z` + `coherence_valid` + `coherence_r` (the live cross-device coherence snapshot; `coherence_valid=false` whenever the monitor is disabled, stale, or never computed — never a fake zero), `purity_label` (canonical string, see below), `integrated_bytes`, `integrator`.
+
+RPCs: `GetDraw` (unary) and `StreamDraws` (bidirectional). Every draw passes the same `RequestGate` as the byte protocols — `block_bytes` is the accounted quantity, so draw-serving API keys need `max_bytes_per_request >= integration.block_bytes` (the service-wide default of 16384 is far below the 2 MiB default block).
+
+Serving a draw requires configuration: `integration.sources` lists the drawable ids and **each must declare a `fingerprint:` path** (fitted offline with `scripts/fit_fingerprint.py`); a missing or invalid fingerprint refuses server startup — there are no silent ideal-value baselines. Profiles are not drawable in this iteration.
 
 ## Experiment arms: profiles and PRNG controls
 
@@ -165,6 +182,80 @@ which is exactly the XNOR gate's output; `.` where they differ) with a
 running agreement % and the pair skew `dt` in µs. Output is ASCII-only
 (survives cp1252 pipes). Works against `mock` devices, so it is
 demoable anywhere; Ctrl-C exits cleanly.
+
+## The QPI layer: purity, integrity, and integrated draws
+
+The **quantum purity and integrity (QPI) layer** is this server's research core: it turns many weak measurements into one strong, auditable number, and labels every served value with exactly what it is. The research programme it serves — studying whether intent-correlated influence appears in quantum-random processes — used to live in qr-sampler under the name "consciousness signal amplification"; the mechanics now live here, under the more accurate name, and qr-sampler is a thin client. Full theory: *Listening to quantum noise: channels, extractors, integration, and the hybrid instrument* (Entropic Science working note v2, July 2026).
+
+### Three channels an influence could use
+
+A hypothesis about "influence on quantum randomness" is underspecified until it names its channel; every processing choice is silently a bet on one of them:
+
+- **Channel A — bias.** The influence shifts the odds (ones become slightly more likely). Any extractor attenuates it; a hash erases it. The PurityService draw path is the channel-A instrument: it integrates an intact raw block into a baseline-referenced bit-fraction z (`bit_z`, the sufficient statistic for a uniform per-bit bias), so a per-event bias δ over a 2 MiB block yields z ≈ 8192·δ.
+- **Channel B — selection.** The influence never changes the odds; it picks *which* particular outcomes occur within a normal-looking distribution. Aggregate statistics stay clean; the information lives in the specific sequence. The parity profiles and the offline statistics (`majority_vote`, `kmer_mode`) are channel-B instruments.
+- **Channel C — coherence.** The influence induces correlation between two *physically separate* devices. The `CoherenceMonitor` runs the v2 block-correlation formulation: reduce each device's stream to per-block ones-fractions, Pearson-correlate the two series across a scan of relative lags (so clock skew and buffering don't matter), and Fisher-transform the peak into `z_c ~ N(0,1)` under the null. Matched PRNG pairs supply the empirical null (`qbert0g coherence null`).
+
+### Purity by subtraction
+
+Integration cannot sort quantum bits from classical bits — nothing can, per measurement. What it can do: classical *noise* is zero-mean and averages away as √n; classical *structure* (the device's bias, its correlations, its slow drift) is static or slow, so it is measured exhaustively beforehand and every statistic is referenced to that measured baseline — the **fingerprint** — rather than to a theoretical ideal. What survives integration-plus-referencing is fresh, systematic deviation from the characterized device: a quantity whose classical explanations have been individually measured and subtracted, and every subtraction is auditable (the fingerprint file's sha256 rides on every draw's provenance record). Fingerprints are **frozen at load** — a drifting baseline would slowly absorb exactly the sustained signal the integrators exist to see; re-characterization is an operator action between runs (`scripts/fit_fingerprint.py`).
+
+Every draw also carries a canonical **purity label** — `origin/integrity/processing[/expanded][/amplified:<n>]/qf:<tier>[/QV]` (e.g. `quantum/intact/raw/amplified:2097152/qf:unrated/QV`). Labels record what a source is; they never gate what it may do. The `QV` (quantum_verified) bit is per-request: origin quantum AND integrity intact AND a clean device health snapshot at measurement AND the live block within `purity.verify_sigma` of the fingerprint.
+
+### The hybrid instrument: a lever and a gate
+
+Downstream (qr-sampler's `qthought_purity` preset), the two channels compose into a two-channel sampling architecture: the **lever** (channel A) — each token draw's `u` steers the probability-ordered token CDF, so a sustained nudge steers selection smoothly toward the conventional or the exotic; and the **gate** (channel C) — the coherence statistic modulates sampling temperature, bounded above and fail-safe by construction: absent, broken, stale, or null coherence yields exactly base temperature, so the failure mode of the exotic machinery is a boring, well-behaved language model. The gate lags the lever by one draw (coherence measured through token *t−1* gates token *t*) — structural causality, not simulation.
+
+### QPI CLI
+
+```bash
+qbert0g draws pull --source dragonfly-0 --n 2000 --out u.txt
+    # N draws through the EXACT PurityService serving path (no gRPC, no gate):
+    # router read -> integrate -> label; one u per line; one provenance record
+    # per draw (protocol: "cli" + the draw extras). Feed u.txt to a KS test
+    # for the live-device uniformity check. --bytes overrides the block size.
+
+qbert0g coherence null --minutes 30 --ids prng-a,prng-b --out null.json
+    # Empirical null of z_c over a matched prng_uniform pair (no hardware).
+    # JSON output: config echo, seeds + stream offsets (fully regenerable),
+    # z_c summary with quantiles incl. 0.999, and a suggested gate threshold.
+    # Point coherence.null_ref at the output. prng_markov is refused (its
+    # regeneration is O(offset)). --evaluations N for an exact count.
+
+qbert0g sources describe dragonfly-0
+    # Canonical purity label, fingerprint path + sha256 (or "none"), default
+    # integrator + block size, drawability, coherence-pair membership.
+    # Config-only: never touches devices.
+```
+
+### QPI configuration
+
+```yaml
+integration:
+  block_bytes: 2097152        # bytes integrated per draw (2 MiB: z ~ 8192*delta)
+  default_integrator: bit_z   # serve path: bit_z | byte_z (aux/offline refused)
+  secondaries: []             # cusum / rw_excursion — provenance-only aux stats
+  sources: []                 # drawable ids; each REQUIRES fingerprint: on its entry
+coherence:
+  enabled: false
+  pair: []                    # exactly 2 device ids when enabled
+  block_bytes: 1024           # ones-fraction reduction block
+  blocks_per_side: 32         # read per device per evaluation
+  lag_scan_blocks: 4          # Pearson r scanned at lags in [-N, +N]
+  min_valid_blocks: 24        # k_eff below this => evaluation invalid
+  refresh_s: 1.0
+  max_age_s: 5.0              # older snapshots serve coherence_valid=false
+  null_ref: null              # `qbert0g coherence null` output (informational)
+  null_pair: []               # default prng_uniform pair for the null CLI
+purity:
+  verify_sigma: 6.0           # |z| tolerance for the quantum_verified bit
+devices:
+  - id: "dragonfly-0"
+    type: "dragonfly"
+    path: "/dev/ttyQRNG0"
+    fingerprint: "fingerprints/dragonfly-0_v1.json"   # scripts/fit_fingerprint.py
+```
+
+Integrators: `bit_z` (default; neff-corrected ones-fraction z) and `byte_z` (the historical qr-sampler byte-mean statistic, for continuity) serve draws; `cusum` and `rw_excursion` are aux secondaries (intermittent influence); `majority_vote` and `kmer_mode` are offline/CLI-only. The serve path refuses everything outside `SERVE_INTEGRATORS` at startup.
 
 ## API key management
 
@@ -244,9 +335,10 @@ Validation is strict: **unknown keys are rejected at startup**, so a typo can ne
 
 ```bash
 pip install -e .[dev]
-make test          # pytest (46 tests; hardware not required — mock device)
+make test          # pytest (hardware not required — mock device)
 make check         # ruff + pytest
-make proto         # regenerate protobuf stubs after editing .proto files
+make proto         # regenerate stubs for all three .proto files (qrng,
+                   # entropy_service, purity_service); must be a no-op diff in CI
 ```
 
 The cross-repo seam tests (`tests/test_qr_sampler_seam.py`) run automatically when qr-sampler is importable (`pip install -e ../qr-sampler`) and skip otherwise.
@@ -256,15 +348,23 @@ The cross-repo seam tests (`tests/test_qr_sampler_seam.py`) run automatically wh
 ```
 Qbert0G/
 ├── src/qbert0g/
-│   ├── cli.py           # qbert0g serve | keys | check-config
+│   ├── cli.py           # serve | keys | check-config | sources | profiles | draws | coherence
 │   ├── config.py        # strict YAML schema (unknown keys rejected)
 │   ├── database.py      # API keys + usage tracking (SQLite, hashed keys)
 │   ├── devices.py       # DeviceManager: pyqcc drivers + mock, flush, failover
+│   ├── controls.py      # seeded PRNG control sources (NOT quantum)
+│   ├── profiles.py      # deterministic transforms (identity/xnor/parity)
+│   ├── sources.py       # SourceRouter: one id namespace + provenance JSONL
+│   ├── fingerprint.py   # frozen per-source statistical baselines (QPI)
+│   ├── integrators.py   # integration statistics: raw block -> (z, u, aux)
+│   ├── purity.py        # purity taxonomy + canonical labels
+│   ├── coherence.py     # block correlation + background CoherenceMonitor
 │   ├── gate.py          # shared request pipeline (auth, limits, measure)
-│   ├── server.py        # both gRPC servicers + QbertServer lifecycle
-│   └── proto/           # qrng.proto + entropy_service.proto + generated stubs
-├── tests/               # config, database, devices, server, qr-sampler seam
-├── examples/client.py   # both protocols, runnable
+│   ├── server.py        # all three gRPC servicers + QbertServer lifecycle
+│   └── proto/           # qrng + entropy_service + purity_service protos & stubs
+├── scripts/             # fit_markov.py, fit_fingerprint.py (offline fitting)
+├── tests/               # config, devices, server, QPI, qr-sampler seam
+├── examples/client.py   # byte protocols, runnable
 └── config.yaml.example  # annotated canonical config
 ```
 

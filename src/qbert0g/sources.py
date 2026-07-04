@@ -185,6 +185,35 @@ class SourceRouter:
             )
         raise ValueError(f"sources watch takes one or two device ids, got {len(ids)}")
 
+    async def coherence_pair_read(
+        self, input_ids: Sequence[str], num_bytes: int
+    ) -> tuple[list[bytes], SourceRead]:
+        """One coherence evaluation's raw pair read (CoherenceMonitor seam).
+
+        Private entry point for the background coherence monitor — NOT a
+        serving endpoint. Reuses the exact paired-read choreography
+        (:meth:`_paired_device_read`: sorted-id lock order, one
+        freshness flush per device per evaluation, per-chunk monotonic
+        timestamps). Returns the two raw sides UNTRANSFORMED plus a
+        :class:`SourceRead` carrying the provenance facts (``data`` is
+        empty — nothing is served).
+        """
+        if len(input_ids) != 2:
+            raise ValueError(
+                f"coherence pair read takes exactly two device ids, got {len(input_ids)}"
+            )
+        owner = f"coherence({input_ids[0]},{input_ids[1]})"
+        raw, facts, epoch_ns, skew = await self._paired_device_read(owner, input_ids, num_bytes)
+        read = SourceRead(
+            data=b"",
+            source_id=owner,
+            timestamp_ns=epoch_ns,
+            transform=None,
+            inputs=facts,
+            max_pair_skew_ns=skew,
+        )
+        return raw, read
+
     # ── plain devices (delegation — behavior unchanged) ────────────────
 
     async def _read_device(
@@ -397,11 +426,14 @@ class SourceRouter:
         served_bytes: int,
         sequence_id: int | None = None,
         api_key_id: str | None = None,
+        extras: dict | None = None,
     ) -> dict:
         """Compose and append the per-request provenance record.
 
         Raises :class:`ProvenanceWriteError` only in strict mode. Plain
         device requests get records too — they are sources like any other.
+        *extras* (protocol-specific fields — coherence statistics, draw
+        integration facts) are merged flat into the record.
         """
         record = {
             "ts": datetime.now(UTC).isoformat(),
@@ -415,6 +447,8 @@ class SourceRouter:
             "max_pair_skew_ns": read.max_pair_skew_ns,
             "api_key_id": api_key_id,
         }
+        if extras:
+            record.update(extras)
         self.provenance.write(record)
         return record
 

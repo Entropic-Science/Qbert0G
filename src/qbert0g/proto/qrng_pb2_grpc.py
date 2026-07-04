@@ -5,7 +5,7 @@ import warnings
 
 from qbert0g.proto import qrng_pb2 as qbert0g_dot_proto_dot_qrng__pb2
 
-GRPC_GENERATED_VERSION = '1.80.0'
+GRPC_GENERATED_VERSION = '1.81.1'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -25,7 +25,7 @@ if _version_not_supported:
     )
 
 
-class QuantumRNGStub(object):
+class QuantumRNGStub:
     """Service definition
     """
 
@@ -42,7 +42,7 @@ class QuantumRNGStub(object):
                 _registered_method=True)
 
 
-class QuantumRNGServicer(object):
+class QuantumRNGServicer:
     """Service definition
     """
 
@@ -69,7 +69,7 @@ def add_QuantumRNGServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class QuantumRNG(object):
+class QuantumRNG:
     """Service definition
     """
 

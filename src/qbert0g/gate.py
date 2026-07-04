@@ -14,13 +14,14 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 import grpc
 
 from .config import Config
 from .database import Database
-from .sources import ProvenanceWriteError, SourceRouter, SourceUnavailableError
+from .sources import ProvenanceWriteError, SourceRead, SourceRouter, SourceUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,8 @@ class RequestGate:
         *,
         protocol: str,
         sequence_id: int | None = None,
+        requested_source_id: str | None = None,
+        provenance_extras: dict | Callable[[SourceRead], Awaitable[dict]] | None = None,
     ) -> Measurement:
         """Validate the request end-to-end and read fresh bytes.
 
@@ -83,6 +86,20 @@ class RequestGate:
         failure; on success writes the provenance record, records usage,
         and returns a :class:`Measurement`. *protocol* / *sequence_id*
         exist solely for the provenance record.
+
+        *requested_source_id* overrides the API key's source binding —
+        honored ONLY for ``protocol="qr_purity"`` (the PurityService
+        draw path) and only for ids in ``integration.sources``; any
+        other combination aborts ``INVALID_ARGUMENT``. Defaults preserve
+        the existing behavior exactly.
+
+        *provenance_extras* is merged flat into the (single) provenance
+        record. It may be a plain dict, or an async callable receiving
+        the completed :class:`~qbert0g.sources.SourceRead` — the draw
+        path needs extras (z, purity label, ...) that depend on the
+        measured bytes, and "exactly one provenance record per request"
+        forbids a second write. The callable runs after the read and
+        before the record is written.
         """
         config = self._config
 
@@ -134,11 +151,25 @@ class RequestGate:
             )
 
         # ── source routing ──────────────────────────────────────────────
-        primary_source = key_info["primary_device_id"]  # binds to ANY source id
-        if primary_source == "*":
-            primary_source = self._router.default_device_id()
-            if primary_source is None:
-                await context.abort(grpc.StatusCode.UNAVAILABLE, "No devices available")
+        if requested_source_id is not None:
+            if protocol != "qr_purity":
+                await context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    "per-request source selection is a PurityService draw feature",
+                )
+            if requested_source_id not in config.integration.sources:
+                await context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"source {requested_source_id!r} is not drawable "
+                    "(not in integration.sources)",
+                )
+            primary_source = requested_source_id
+        else:
+            primary_source = key_info["primary_device_id"]  # binds to ANY source id
+            if primary_source == "*":
+                primary_source = self._router.default_device_id()
+                if primary_source is None:
+                    await context.abort(grpc.StatusCode.UNAVAILABLE, "No devices available")
 
         try:
             read = await self._router.read(
@@ -157,6 +188,14 @@ class RequestGate:
 
         timestamp_ns = read.timestamp_ns if self._config.freshness.emit_generation_timestamp else 0
 
+        extras = provenance_extras
+        if callable(extras):
+            # Draw-path extras depend on the measured bytes (integration
+            # statistics); resolved here so the request still produces
+            # exactly ONE provenance record. The callable aborts the RPC
+            # itself on a draw-specific failure.
+            extras = await extras(read)
+
         try:
             self._router.record_provenance(
                 read,
@@ -164,6 +203,7 @@ class RequestGate:
                 served_bytes=num_bytes,
                 sequence_id=sequence_id,
                 api_key_id=key_info["id"],
+                extras=extras,
             )
         except ProvenanceWriteError as exc:
             # provenance.strict: an unrecorded request must not be served.

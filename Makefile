@@ -25,7 +25,8 @@ dev:
 proto:
 	python -m grpc_tools.protoc -Isrc \
 		--python_out=src --grpc_python_out=src \
-		src/qbert0g/proto/qrng.proto src/qbert0g/proto/entropy_service.proto
+		src/qbert0g/proto/qrng.proto src/qbert0g/proto/entropy_service.proto \
+		src/qbert0g/proto/purity_service.proto
 	@echo "Regenerated src/qbert0g/proto/*_pb2*.py"
 
 test:

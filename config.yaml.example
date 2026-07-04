@@ -28,6 +28,11 @@ auth:
   header: "api-key"
 
 # ── Service-wide default caps (overridable per API key) ──────────────────────
+# NOTE (QPI draws): a PurityService draw accounts its whole integration
+# block against the key's limits, so draw-serving keys need
+# max_bytes_per_request >= integration.block_bytes (2097152 at the
+# default) — raise it here or per key; the 16384 default below refuses
+# default-size draws.
 limits:
   max_bytes_per_request: 16384
   max_bytes_per_day: 104857600   # 100 MB
@@ -92,10 +97,12 @@ devices:
   #   type: "chardev"
   #   path: "/dev/qrngDF0"
   #   pci_address: "0000:09:00.0"
+  #   fingerprint: "fingerprints/dragonfly-0_v1.json"  # required to serve QPI draws
   # - id: "dragonfly-1"
   #   type: "chardev"
   #   path: "/dev/qrngDF1"
   #   pci_address: "0000:0a:00.0"
+  #   fingerprint: "fingerprints/dragonfly-1_v1.json"
   #
   # - id: "mock-0"                # development only — loudly logged, NOT quantum
   #   type: "mock"
@@ -162,6 +169,42 @@ profiles:
 profiles_defaults:
   chunk_bytes: 4096               # alternating paired-read chunk size
   max_skew_ns: 50000000           # pair-skew WARNING threshold (50 ms)
+
+# ── QPI: server-side integration, coherence, purity ─────────────────────────
+# The QPI layer serves whole-block integrated draws (one uniform u per
+# request) over the qr_purity.PurityService. Every drawable source id
+# in integration.sources MUST have a `fingerprint:` path on its
+# devices[]/controls[] entry — fitted offline from raw dumps with
+# scripts/fit_fingerprint.py; the file must exist and validate at
+# startup (baselines are frozen at load; no runtime adaptation).
+# REMINDER: draw-serving API keys need max_bytes_per_request >=
+# integration.block_bytes (see the limits section above).
+#
+# integration:
+#   block_bytes: 2097152          # 2 MiB per draw (z ≈ 8192·δ sensitivity)
+#   default_integrator: bit_z     # serve path: bit_z | byte_z only
+#   secondaries: []               # aux stats per draw: cusum, rw_excursion
+#   sources: ["dragonfly-0"]      # ids drawable via PurityService
+#
+# Background block-correlation monitor between two devices. Draws
+# report the latest value; stale (> max_age_s) or unavailable is served
+# as coherence_valid=false — never a fake zero.
+# coherence:
+#   enabled: true
+#   pair: ["dragonfly-0", "dragonfly-1"]
+#   block_bytes: 1024             # ones-fraction reduction block
+#   blocks_per_side: 32
+#   lag_scan_blocks: 4            # Pearson r scanned at lags in [-4, +4]
+#   min_valid_blocks: 24
+#   refresh_s: 1.0
+#   max_age_s: 5.0
+#   null_ref: null                # output of `qbert0g coherence null` (informational)
+#   null_pair: []                 # 2 prng_uniform control ids for the null CLI
+#
+# Purity-label serve-time knobs: quantum_verified requires the live
+# block's |z| within verify_sigma of the fingerprint baseline.
+# purity:
+#   verify_sigma: 6.0
 
 # ── Provenance log ───────────────────────────────────────────────────────────
 # Append-only JSONL, ONE record per served request (all protocols AND

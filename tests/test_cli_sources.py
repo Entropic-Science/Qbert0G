@@ -10,15 +10,19 @@ byte-identity: regenerate the served block offline from NOTHING but its
 provenance record (seeds + stream_offset_bytes + the normative xnor).
 """
 
+import hashlib
 import json
+import math
 from pathlib import Path
 
+import pytest
 import yaml
 from conftest import SEED_A, SEED_B
 
 from qbert0g.cli import main, render_watch_sample
 from qbert0g.controls import uniform_stream_bytes
 from qbert0g.profiles import xnor
+from qbert0g.purity import EntropyLabel
 
 
 def _write_config(tmp_path: Path) -> Path:
@@ -39,6 +43,52 @@ def _write_config(tmp_path: Path) -> Path:
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
     return path
+
+
+#: A neff-consistent synthetic fingerprint matching the mock device.
+_FP_JSON = {
+    "device_id": "mock",
+    "firmware": "none",
+    "ones_fraction": 0.5,
+    "byte_mean": 127.5,
+    "byte_std": 73.9,
+    "bit_acf": {"1": 0.0, "2": 0.0, "3": 0.0, "4": 0.0, "8": 0.0},
+    "neff_factor": 1.0,
+    "quantum_fraction_tier": "unrated",
+    "source_dumps_sha256": ["ab" * 32],
+    "fitted_utc": "2026-07-04T00:00:00+00:00",
+    "session_ref": "synthetic-test-fixture",
+}
+
+
+def _write_fingerprint(tmp_path: Path, device_id: str) -> Path:
+    path = tmp_path / f"fp-{device_id}.json"
+    path.write_text(json.dumps(dict(_FP_JSON, device_id=device_id)), encoding="utf-8")
+    return path
+
+
+def _write_draw_config(tmp_path: Path) -> tuple[Path, Path]:
+    """A QPI-enabled config: fingerprinted drawable mock-0, coherence pair."""
+    fp_path = _write_fingerprint(tmp_path, "mock-0")
+    data = {
+        "server": {"listen": "127.0.0.1:0"},
+        "database": {"path": str(tmp_path / "cli.db")},
+        "devices": [
+            {"id": "mock-0", "type": "mock", "fingerprint": str(fp_path)},
+            {"id": "mock-1", "type": "mock"},
+        ],
+        "controls": [{"id": "prng-a", "type": "prng_uniform", "seed": SEED_A}],
+        "integration": {
+            "block_bytes": 4096,
+            "sources": ["mock-0"],
+            "secondaries": ["cusum"],
+        },
+        "coherence": {"enabled": True, "pair": ["mock-0", "mock-1"]},
+        "provenance": {"path": str(tmp_path / "provenance.jsonl")},
+    }
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    return path, fp_path
 
 
 class TestSourcesList:
@@ -165,3 +215,178 @@ class TestSourcesWatch:
         assert len(lines) == 2
         assert all(line.startswith("mock-0") for line in lines)
         assert not any("agree" in line for line in lines)
+
+
+class TestDrawsPull:
+    """`draws pull` — QPI draws through the exact serving path (spec §3.8)."""
+
+    def test_pull_writes_u_file_and_cli_provenance_with_draw_extras(self, tmp_path):
+        config, fp_path = _write_draw_config(tmp_path)
+        out_file = tmp_path / "u.txt"
+        main([
+            "draws", "--config", str(config), "pull",
+            "--source", "mock-0", "--n", "5", "--out", str(out_file),
+        ])
+        lines = out_file.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 5
+        for line in lines:
+            u = float(line)
+            assert 0.0 < u < 1.0  # clamped; never degenerate
+
+        records = [
+            json.loads(line)
+            for line in (tmp_path / "provenance.jsonl").read_text().splitlines()
+        ]
+        draw_records = [r for r in records if r["protocol"] == "cli"]
+        assert len(draw_records) == 5
+        fp_sha256 = hashlib.sha256(fp_path.read_bytes()).hexdigest()
+        for record in draw_records:
+            assert record["source_id"] == "mock-0"
+            assert record["served_bytes"] == 4096
+            assert record["integrator"] == "bit_z"
+            assert record["integrated_bytes"] == 4096
+            assert math.isfinite(record["z"])
+            assert set(record["secondaries"]) == {"cusum"}
+            label = EntropyLabel.from_canonical(record["purity_label"])  # round-trips
+            assert label.amplified and label.integration_n == 4096
+            assert record["fingerprint_sha256"] == fp_sha256
+            assert record["coherence"] is None  # no monitor in the CLI — never faked
+
+    def test_block_bytes_override(self, tmp_path):
+        config, _ = _write_draw_config(tmp_path)
+        out_file = tmp_path / "u.txt"
+        main([
+            "draws", "--config", str(config), "pull",
+            "--source", "mock-0", "--n", "1", "--bytes", "1024", "--out", str(out_file),
+        ])
+        record = json.loads(
+            (tmp_path / "provenance.jsonl").read_text().splitlines()[-1]
+        )
+        assert record["integrated_bytes"] == 1024
+
+    def test_non_drawable_source_is_refused(self, tmp_path, capsys):
+        config, _ = _write_draw_config(tmp_path)
+        with pytest.raises(SystemExit) as excinfo:
+            main([
+                "draws", "--config", str(config), "pull",
+                "--source", "mock-1", "--n", "1", "--out", str(tmp_path / "u.txt"),
+            ])
+        assert excinfo.value.code == 2
+        assert "not drawable" in capsys.readouterr().err
+
+
+class TestCoherenceNull:
+    """`coherence null` — the empirical PRNG-pair null (spec §3.8)."""
+
+    def test_output_schema_and_summary(self, tmp_path, capsys):
+        config = _write_config(tmp_path)
+        out_file = tmp_path / "null.json"
+        main([
+            "coherence", "--config", str(config), "null",
+            "--evaluations", "50", "--ids", "prng-a,prng-b", "--out", str(out_file),
+        ])
+        data = json.loads(out_file.read_text(encoding="utf-8"))
+        assert data["protocol"] == "coherence_null"
+        assert data["config"] == {
+            "block_bytes": 1024,
+            "blocks_per_side": 32,
+            "lag_scan_blocks": 4,
+            "min_valid_blocks": 24,
+            "refresh_s": 1.0,
+        }
+        assert [p["id"] for p in data["pair"]] == ["prng-a", "prng-b"]
+        assert data["pair"][0]["seed"] == SEED_A
+        assert data["pair"][0]["stream_offset_bytes_start"] == 0
+        assert data["evaluations_requested"] == 50
+        assert data["evaluations_valid"] == 50
+        assert data["evaluations_invalid"] == 0
+        assert "0.999" in data["z_c"]["quantiles"]
+        assert "0.999" in data["abs_z_c"]["quantiles"]
+        # Independent PRNGs: max-over-lags inflates |z_c| above N(0,1),
+        # but the null stays finite, positive, and loosely bounded.
+        assert 0.0 < data["suggested_threshold"] < 10.0
+        assert data["suggested_threshold"] == data["abs_z_c"]["quantiles"]["0.999"]
+        assert "Suggested threshold" in capsys.readouterr().out
+
+    def test_minutes_map_to_refresh_cadence(self, tmp_path):
+        config = _write_config(tmp_path)
+        out_file = tmp_path / "null.json"
+        main([
+            "coherence", "--config", str(config), "null",
+            "--minutes", "0.1", "--ids", "prng-a,prng-b", "--out", str(out_file),
+        ])
+        data = json.loads(out_file.read_text(encoding="utf-8"))
+        assert data["evaluations_requested"] == 6  # 0.1 * 60 / refresh_s(1.0)
+
+    def test_markov_pair_is_refused(self, tmp_path, capsys):
+        data = yaml.safe_load(_write_config(tmp_path).read_text(encoding="utf-8"))
+        data["controls"].append(
+            {"id": "markov-a", "type": "prng_markov", "seed": SEED_B,
+             "model": str(tmp_path / "missing.npz")}
+        )
+        config = tmp_path / "config-markov.yaml"
+        config.write_text(yaml.safe_dump(data), encoding="utf-8")
+        with pytest.raises(SystemExit) as excinfo:
+            main([
+                "coherence", "--config", str(config), "null",
+                "--evaluations", "1", "--ids", "markov-a,prng-b",
+                "--out", str(tmp_path / "null.json"),
+            ])
+        assert excinfo.value.code == 2
+        err = capsys.readouterr().err
+        assert "prng_uniform" in err and "O(offset)" in err
+
+    def test_non_control_id_is_refused(self, tmp_path, capsys):
+        config = _write_config(tmp_path)
+        with pytest.raises(SystemExit) as excinfo:
+            main([
+                "coherence", "--config", str(config), "null",
+                "--evaluations", "1", "--ids", "mock-0,prng-b",
+                "--out", str(tmp_path / "null.json"),
+            ])
+        assert excinfo.value.code == 2
+        assert "not a configured control" in capsys.readouterr().err
+
+
+class TestSourcesDescribe:
+    """`sources describe` — config-only QPI facts per source (spec §3.8)."""
+
+    def test_golden_output_drawable_device(self, tmp_path, capsys):
+        config, fp_path = _write_draw_config(tmp_path)
+        main(["sources", "--config", str(config), "describe", "mock-0"])
+        fp_sha256 = hashlib.sha256(fp_path.read_bytes()).hexdigest()
+        assert capsys.readouterr().out == (
+            "id:                  mock-0\n"
+            "kind:                device (mock)\n"
+            "purity_label:        true_random/intact/raw/qf:unrated\n"
+            f"fingerprint:         {fp_path}\n"
+            f"fingerprint_sha256:  {fp_sha256}\n"
+            "integrator:          bit_z (block 4096 bytes)\n"
+            "drawable:            yes (in integration.sources)\n"
+            "coherence_pair:      yes (mock-0,mock-1)\n"
+        )
+
+    def test_control_without_fingerprint(self, tmp_path, capsys):
+        config, _ = _write_draw_config(tmp_path)
+        main(["sources", "--config", str(config), "describe", "prng-a"])
+        out = capsys.readouterr().out
+        assert "kind:                control (prng_uniform) -- PRNG, NOT quantum\n" in out
+        assert "purity_label:        pseudo/intact/raw/qf:unrated\n" in out
+        assert "fingerprint:         none\n" in out
+        assert "fingerprint_sha256:  none\n" in out
+        assert "drawable:            no (not in integration.sources)\n" in out
+        assert "coherence_pair:      no\n" in out
+
+    def test_profile_combines_input_labels(self, tmp_path, capsys):
+        config = _write_config(tmp_path)
+        main(["sources", "--config", str(config), "describe", "pp-match"])
+        out = capsys.readouterr().out
+        assert "kind:                profile (xnor over prng-a,prng-b)\n" in out
+        assert "purity_label:        pseudo/intact/raw/qf:unrated\n" in out
+
+    def test_unknown_id_is_refused(self, tmp_path, capsys):
+        config = _write_config(tmp_path)
+        with pytest.raises(SystemExit) as excinfo:
+            main(["sources", "--config", str(config), "describe", "nope"])
+        assert excinfo.value.code == 2
+        assert "not a configured" in capsys.readouterr().err

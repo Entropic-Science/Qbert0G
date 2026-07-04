@@ -5,7 +5,7 @@ import warnings
 
 from qbert0g.proto import entropy_service_pb2 as qbert0g_dot_proto_dot_entropy__service__pb2
 
-GRPC_GENERATED_VERSION = '1.80.0'
+GRPC_GENERATED_VERSION = '1.81.1'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -25,7 +25,7 @@ if _version_not_supported:
     )
 
 
-class EntropyServiceStub(object):
+class EntropyServiceStub:
     """Entropy generation service.
 
     Provides random bytes on demand, with three transport modes:
@@ -55,7 +55,7 @@ class EntropyServiceStub(object):
                 _registered_method=True)
 
 
-class EntropyServiceServicer(object):
+class EntropyServiceServicer:
     """Entropy generation service.
 
     Provides random bytes on demand, with three transport modes:
@@ -102,7 +102,7 @@ def add_EntropyServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class EntropyService(object):
+class EntropyService:
     """Entropy generation service.
 
     Provides random bytes on demand, with three transport modes:

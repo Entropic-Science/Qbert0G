@@ -18,6 +18,16 @@ Subcommands:
   generation through the EXACT SourceRouter serving path (no gRPC, no
   gate), for feeding ent / PractRand; writes a provenance record with
   ``protocol: "cli"``.
+- ``qbert0g draws pull --source X --n N`` — QPI draws through the exact
+  PurityService serving path (router read → integrate → label; no gRPC,
+  no gate): one ``u`` per line, one provenance record per draw with
+  ``protocol: "cli"`` plus the draw extras.
+- ``qbert0g coherence null`` — empirical null distribution of the
+  coherence statistic ``z_c`` over a matched ``prng_uniform`` pair
+  (no hardware touched); JSON output consumable as ``coherence.null_ref``.
+- ``qbert0g sources describe <id>`` — one source's canonical purity
+  label, fingerprint, drawability and coherence-pair membership.
+  Config-only: never touches devices.
 
 Config resolution everywhere: ``--config`` > ``QBERT0G_CONFIG`` env >
 ``./config.yaml``.
@@ -27,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 import time
@@ -205,8 +216,8 @@ async def _run_keys(args: argparse.Namespace) -> None:
 # ── sources / profiles subcommands ───────────────────────────────────────
 
 
-async def _with_router(config: Config, fn) -> None:
-    """Run *fn(router)* against an initialized DeviceManager + SourceRouter.
+async def _with_stack(config: Config, fn) -> None:
+    """Run *fn(devices, router)* against an initialized device stack.
 
     The same construction path the server uses — CLI reads exercise the
     exact serving code, only bypassing gRPC and the request gate.
@@ -217,9 +228,14 @@ async def _with_router(config: Config, fn) -> None:
     devices = DeviceManager(config)
     await devices.initialize()
     try:
-        await fn(SourceRouter(config, devices))
+        await fn(devices, SourceRouter(config, devices))
     finally:
         await devices.shutdown()
+
+
+async def _with_router(config: Config, fn) -> None:
+    """Run *fn(router)* — :func:`_with_stack` for router-only commands."""
+    await _with_stack(config, lambda _devices, router: fn(router))
 
 
 async def _run_sources_list(args: argparse.Namespace) -> None:
@@ -336,6 +352,293 @@ async def _run_profiles_pull(args: argparse.Namespace) -> None:
     await _with_router(config, _pull)
 
 
+# ── QPI subcommands: draws pull / coherence null / sources describe ─────
+
+
+async def _run_draws_pull(args: argparse.Namespace) -> None:
+    """QPI draws through the exact serving path (no gRPC, no gate).
+
+    Mirrors ``profiles pull``: router read → integrate (primary +
+    configured secondaries) → resolve the per-request label bits →
+    provenance record with ``protocol: "cli"`` and the same draw extras
+    the PurityService writes. One ``u`` per line in ``--out`` — feed it
+    to a KS test for the live-device uniformity check (an operator
+    action, deliberately not a CI gate).
+    """
+    config = Config.load(args.config)
+    if args.source not in config.integration.sources:
+        print(
+            f"Error: source {args.source!r} is not drawable — draws require an id in "
+            f"integration.sources (configured: {config.integration.sources or 'none'})",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    block_bytes = args.bytes or config.integration.block_bytes
+    names = [config.integration.default_integrator, *config.integration.secondaries]
+
+    # Deferred: server pulls in grpc; integrators pull in numpy.
+    from .integrators import integrate
+    from .purity import resolve_request_bits
+    from .server import build_qpi_context, quantum_verified
+
+    async def _pull(devices, router) -> None:
+        # Same composition the server builds at startup — fingerprints
+        # load-or-refuse (FR-Q3). No coherence monitor in the CLI: draws
+        # here carry `coherence: null`, never a fake value.
+        qpi = build_qpi_context(config, devices, None)
+        u_values: list[float] = []
+        for _ in range(args.n):
+            read = await router.read(args.source, block_bytes)  # no timeout: operator tool
+            entry = qpi.fingerprints.get(read.source_id)
+            if entry is None:  # failover resolved outside the drawable set
+                print(
+                    f"Error: serving source {read.source_id!r} has no loaded fingerprint "
+                    "(failover resolved outside integration.sources)",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+            fp, fp_sha256 = entry
+            results = [integrate(name, read.data, fp) for name in names]
+            primary = results[0]
+            secondaries = {
+                name: result.aux
+                for name, result in zip(names[1:], results[1:], strict=True)
+            }
+            static = qpi.labels[read.source_id]
+            state = devices.devices.get(read.source_id)
+            verified = quantum_verified(static, state, primary.z, qpi.purity.verify_sigma)
+            label = resolve_request_bits(
+                static, integration_n=len(read.data), quantum_verified=verified
+            )
+            router.record_provenance(
+                read,
+                protocol="cli",
+                served_bytes=block_bytes,
+                extras={
+                    "integrator": names[0],
+                    "integrated_bytes": len(read.data),
+                    "z": primary.z,
+                    "secondaries": secondaries,
+                    "purity_label": label.canonical(),
+                    "fingerprint_sha256": fp_sha256,
+                    "coherence": None,
+                },
+            )
+            u_values.append(primary.u)
+        Path(args.out).write_text(
+            "".join(f"{u:.17g}\n" for u in u_values), encoding="utf-8"
+        )
+        print(
+            f"Wrote {len(u_values)} u value(s) from {args.source!r} to {args.out} "
+            f"({names[0]} over {block_bytes}-byte blocks)"
+        )
+        print(
+            f"Provenance: {len(u_values)} record(s) appended to {config.provenance.path}"
+        )
+
+    await _with_stack(config, _pull)
+
+
+def _run_coherence_null(args: argparse.Namespace) -> None:
+    """Empirical null of the coherence statistic over a matched PRNG pair.
+
+    No hardware is touched: the pair are ``prng_uniform`` controls
+    (O(1)-seekable — the JSON's seeds + start offsets regenerate every
+    block). ``prng_markov`` is refused: its regeneration is O(offset),
+    so a long null run could not be audited cheaply. The output JSON is
+    what ``coherence.null_ref`` points at.
+    """
+    config = Config.load(args.config)
+    cfg = config.coherence
+    ids = (
+        [part.strip() for part in args.ids.split(",") if part.strip()]
+        if args.ids
+        else list(cfg.null_pair)
+    )
+    if len(ids) != 2 or ids[0] == ids[1]:
+        print(
+            "Error: the null needs exactly 2 distinct control ids "
+            "(--ids A,B or coherence.null_pair in the config)",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    control_cfg = {c.id: c for c in config.controls}
+    for control_id in ids:
+        entry = control_cfg.get(control_id)
+        if entry is None:
+            print(
+                f"Error: {control_id!r} is not a configured control — the null "
+                "distribution runs over PRNG controls only",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        if entry.type != "prng_uniform":
+            print(
+                f"Error: control {control_id!r} is {entry.type!r} — the null pair must "
+                "be prng_uniform (O(1)-seekable); markov regeneration is O(offset)",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+    if args.evaluations is not None:
+        evaluations = args.evaluations
+    else:
+        # --minutes maps to the monitor's cadence: one evaluation per
+        # refresh_s of simulated wall time (the PRNG null itself is
+        # compute-bound, not clocked).
+        evaluations = max(1, int(args.minutes * 60.0 / cfg.refresh_s))
+
+    import numpy as np  # deferred: numpy is heavy for --help
+
+    from .coherence import CoherenceInvalidError, block_correlation
+    from .controls import make_control
+
+    controls = {control_id: make_control(control_cfg[control_id]) for control_id in ids}
+    pair_facts = [
+        {
+            "id": control_id,
+            "type": "prng_uniform",
+            "seed": control_cfg[control_id].seed,
+            "stream_offset_bytes_start": controls[control_id].stream_offset_bytes,
+        }
+        for control_id in ids
+    ]
+    need = cfg.blocks_per_side * cfg.block_bytes
+    z_values: list[float] = []
+    invalid = 0
+    for _ in range(evaluations):
+        side_a = controls[ids[0]].read(need)
+        side_b = controls[ids[1]].read(need)
+        try:
+            _r, _lag, z_c, _k_eff = block_correlation(
+                side_a,
+                side_b,
+                block_bytes=cfg.block_bytes,
+                lag_scan=cfg.lag_scan_blocks,
+                min_valid_blocks=cfg.min_valid_blocks,
+            )
+        except CoherenceInvalidError:
+            invalid += 1
+            continue
+        z_values.append(z_c)
+    if not z_values:
+        print("Error: every evaluation was invalid — nothing to summarize", file=sys.stderr)
+        raise SystemExit(1)
+
+    z = np.asarray(z_values)
+    quantile_points = (0.5, 0.9, 0.99, 0.999)
+    suggested = float(np.quantile(np.abs(z), 0.999))
+    output = {
+        "protocol": "coherence_null",
+        "config": {
+            "block_bytes": cfg.block_bytes,
+            "blocks_per_side": cfg.blocks_per_side,
+            "lag_scan_blocks": cfg.lag_scan_blocks,
+            "min_valid_blocks": cfg.min_valid_blocks,
+            "refresh_s": cfg.refresh_s,
+        },
+        "pair": pair_facts,
+        "evaluations_requested": evaluations,
+        "evaluations_valid": len(z_values),
+        "evaluations_invalid": invalid,
+        "z_c": {
+            "mean": float(z.mean()),
+            "std": float(z.std()),
+            "min": float(z.min()),
+            "max": float(z.max()),
+            "quantiles": {str(q): float(np.quantile(z, q)) for q in quantile_points},
+        },
+        "abs_z_c": {
+            "quantiles": {str(q): float(np.quantile(np.abs(z), q)) for q in quantile_points}
+        },
+        # The 0.999 quantile of |z_c|: a per-token false-open rate of
+        # ~1e-3 under the null. Preregister the actual threshold.
+        "suggested_threshold": suggested,
+    }
+    Path(args.out).write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
+    print(
+        f"Coherence null over {ids[0]},{ids[1]}: {len(z_values)} valid evaluation(s) "
+        f"({invalid} invalid), z_c mean {float(z.mean()):+.4f} std {float(z.std()):.4f}"
+    )
+    print(f"Suggested threshold (0.999 |z_c| quantile): {suggested:.4f}")
+    print(f"Wrote {args.out} (point coherence.null_ref at it)")
+
+
+def _static_label_and_fingerprint(config: Config, source_id: str):
+    """``(kind_text, label, fp_path, fp_sha256)`` for any source id, config-only.
+
+    The same derivation :func:`qbert0g.server.build_qpi_context` applies
+    to drawable sources, extended to every kind (profiles combine their
+    input labels). Fingerprint files load-or-refuse, like at startup.
+    """
+    from .fingerprint import load_fingerprint  # deferred with the rest of the stack
+    from .purity import derive_static_label
+
+    def _load(path: str):
+        if not path:
+            return None, "", ""
+        fp, sha256 = load_fingerprint(path)
+        return fp, path, sha256
+
+    device = next((d for d in config.devices if d.id == source_id), None)
+    if device is not None:
+        fp, path, sha256 = _load(device.fingerprint)
+        # chardev has no qcc-cli post-processing chain (mode: None).
+        mode = None if device.type == "chardev" else (
+            device.post_processing or config.post_processing_mode
+        )
+        label = derive_static_label(
+            "device", device_type=device.type, post_processing_mode=mode, fingerprint=fp
+        )
+        return f"device ({device.type})", label, path, sha256
+    control = next((c for c in config.controls if c.id == source_id), None)
+    if control is not None:
+        fp, path, sha256 = _load(control.fingerprint)
+        label = derive_static_label("control", fingerprint=fp)
+        return f"control ({control.type}) -- PRNG, NOT quantum", label, path, sha256
+    profile = next((p for p in config.profiles if p.id == source_id), None)
+    if profile is not None:
+        input_labels = tuple(
+            _static_label_and_fingerprint(config, input_id)[1] for input_id in profile.inputs
+        )
+        label = derive_static_label("profile", input_labels=input_labels)
+        kind = f"profile ({profile.transform} over {','.join(profile.inputs)})"
+        return kind, label, "", ""  # profiles carry no fingerprint of their own
+    print(
+        f"Error: {source_id!r} is not a configured device, control, or profile",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
+def _run_sources_describe(args: argparse.Namespace) -> None:
+    """One source's QPI facts, from the config alone (devices untouched)."""
+    config = Config.load(args.config)
+    kind, label, fp_path, fp_sha256 = _static_label_and_fingerprint(config, args.id)
+    drawable = (
+        "yes (in integration.sources)"
+        if args.id in config.integration.sources
+        else "no (not in integration.sources)"
+    )
+    pair = config.coherence.pair
+    coherence_pair = f"yes ({','.join(pair)})" if args.id in pair else "no"
+    rows = [
+        ("id", args.id),
+        ("kind", kind),
+        ("purity_label", label.canonical()),
+        ("fingerprint", fp_path or "none"),
+        ("fingerprint_sha256", fp_sha256 or "none"),
+        (
+            "integrator",
+            f"{config.integration.default_integrator} "
+            f"(block {config.integration.block_bytes} bytes)",
+        ),
+        ("drawable", drawable),
+        ("coherence_pair", coherence_pair),
+    ]
+    for key, value in rows:
+        print(f"{key + ':':<20} {value}")
+
+
 # ── top-level commands ───────────────────────────────────────────────────
 
 
@@ -447,6 +750,12 @@ def build_parser() -> argparse.ArgumentParser:
     sources_sub.add_parser(
         "list", help="List all devices, controls and profiles with availability"
     )
+    p_describe = sources_sub.add_parser(
+        "describe",
+        help="One source's purity label, fingerprint, drawability and "
+        "coherence-pair membership (config-only; devices untouched)",
+    )
+    p_describe.add_argument("id", help="Source ID (device, control, or profile)")
     p_watch = sources_sub.add_parser(
         "watch",
         help="Live side-by-side bitstream viewer for one or two raw device streams",
@@ -480,6 +789,54 @@ def build_parser() -> argparse.ArgumentParser:
     p_pull.add_argument("--bytes", required=True, type=int, help="Number of bytes to generate")
     p_pull.add_argument("--out", required=True, help="Output file path")
 
+    p_draws = sub.add_parser("draws", help="Offline QPI draw operations")
+    p_draws.add_argument("--config", help="Path to config.yaml")
+    draws_sub = p_draws.add_subparsers(dest="draws_command", required=True)
+    p_draws_pull = draws_sub.add_parser(
+        "pull",
+        help="Pull N integrated draws through the exact PurityService serving "
+        "path (no gRPC, no gate) and write one u per line",
+    )
+    p_draws_pull.add_argument(
+        "--source", required=True, help="Drawable source ID (must be in integration.sources)"
+    )
+    p_draws_pull.add_argument("--n", required=True, type=int, help="Number of draws")
+    p_draws_pull.add_argument(
+        "--bytes",
+        type=int,
+        default=None,
+        help="Block bytes per draw (default: integration.block_bytes)",
+    )
+    p_draws_pull.add_argument(
+        "--out", default="u.txt", help="Output file, one u per line (default: u.txt)"
+    )
+
+    p_coherence = sub.add_parser("coherence", help="Coherence-channel operations")
+    p_coherence.add_argument("--config", help="Path to config.yaml")
+    coherence_sub = p_coherence.add_subparsers(dest="coherence_command", required=True)
+    p_null = coherence_sub.add_parser(
+        "null",
+        help="Empirical null distribution of z_c over a matched prng_uniform "
+        "pair (no hardware; JSON output for coherence.null_ref)",
+    )
+    span = p_null.add_mutually_exclusive_group()
+    span.add_argument(
+        "--minutes",
+        type=float,
+        default=30.0,
+        help="Simulated monitor runtime; evaluations = minutes*60/refresh_s (default: 30)",
+    )
+    span.add_argument(
+        "--evaluations", type=int, default=None, help="Exact number of evaluations to run"
+    )
+    p_null.add_argument(
+        "--ids",
+        default=None,
+        help="Two comma-separated prng_uniform control ids "
+        "(default: coherence.null_pair from the config)",
+    )
+    p_null.add_argument("--out", required=True, help="Output JSON path")
+
     return parser
 
 
@@ -495,10 +852,16 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "sources":
             if args.sources_command == "watch":
                 asyncio.run(_run_sources_watch(args))
+            elif args.sources_command == "describe":
+                _run_sources_describe(args)
             else:
                 asyncio.run(_run_sources_list(args))
         elif args.command == "profiles":
             asyncio.run(_run_profiles_pull(args))
+        elif args.command == "draws":
+            asyncio.run(_run_draws_pull(args))
+        elif args.command == "coherence":
+            _run_coherence_null(args)
     except KeyboardInterrupt:
         pass  # Ctrl-C on `sources watch` (and friends) exits cleanly
     except ConfigError as exc:
