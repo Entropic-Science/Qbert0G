@@ -408,3 +408,65 @@ class TestExampleConfig:
         assert config.controls[0].type == "prng_uniform"
         assert config.profiles[0].transform == "identity"
         assert config.profiles_defaults.chunk_bytes == 4096
+
+
+class TestSharedQrServerConfig:
+    """The box-level shared entropy deployment (deployments/qr-server/).
+
+    One daemon owns both Dragonfly cards; dragonfly-0 is the SOLE draw
+    card and dragonfly-1 is the coherence reference ONLY. These guards
+    pin that topology at the config layer (FR-1/FR-3/FR-4/FR-17/FR-19)
+    so a drift toward drawing dragonfly-1 is a load-time failure, not a
+    silent behaviour change. Kept byte-identical to the qr-sampler
+    qr-server profile copy.
+    """
+
+    @staticmethod
+    def _raw() -> dict:
+        from pathlib import Path
+
+        import yaml
+
+        artifact = (
+            Path(__file__).parent.parent
+            / "deployments"
+            / "qr-server"
+            / "qbert0g.config.yaml.example"
+        )
+        return yaml.safe_load(artifact.read_text(encoding="utf-8"))
+
+    def test_shared_config_parses(self):
+        config = Config.from_dict(self._raw())
+        assert config.server.unix_socket == "/run/qbert0g.sock"
+        assert config.post_processing_mode == "raw"
+        # Draw-serving keys account the whole 2 MiB block: the per-request
+        # cap must clear integration.block_bytes or draws are refused.
+        assert config.limits.max_bytes_per_request >= 2_097_152
+        assert config.integration.block_bytes == 2_097_152
+
+    def test_both_cards_configured_but_only_dragonfly0_is_drawable(self):
+        config = Config.from_dict(self._raw())
+        device_ids = {d.id for d in config.devices}
+        assert {"dragonfly-0", "dragonfly-1"} <= device_ids
+        # dragonfly-0 is the ONLY drawable source; dragonfly-1 is not
+        # served via PurityService, nor via any profile/control.
+        assert config.integration.sources == ["dragonfly-0"]
+        assert "dragonfly-1" not in config.integration.sources
+        assert config.profiles == []  # no profile can front dragonfly-1 as a draw
+        assert config.controls == []
+
+    def test_dragonfly1_appears_only_as_coherence_reference(self):
+        config = Config.from_dict(self._raw())
+        assert config.coherence.enabled is True
+        assert set(config.coherence.pair) == {"dragonfly-0", "dragonfly-1"}
+        # The one and only place dragonfly-1 is referenced is the pair.
+        assert "dragonfly-1" not in config.integration.sources
+
+    def test_pooling_and_pregeneration_are_refused(self):
+        # The shared config ships them false; flipping either is a load error.
+        assert Config.from_dict(self._raw()).freshness.allow_pooling is False
+        for guard in ("allow_pooling", "allow_pregeneration"):
+            raw = self._raw()
+            raw.setdefault("freshness", {})[guard] = True
+            with pytest.raises(ConfigError, match="pooling"):
+                Config.from_dict(raw)

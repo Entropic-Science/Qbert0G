@@ -1,5 +1,6 @@
 """SourceRouter: one id namespace, profile no-failover, skew, provenance."""
 
+import asyncio
 import json
 import logging
 import time
@@ -257,6 +258,82 @@ class TestDescribe:
         rows = {r["id"]: r for r in router.describe()}
         assert "unavailable" in rows["qq-mock"]["availability"]
         assert "mock-1" in rows["qq-mock"]["availability"]
+
+
+class TestConcurrentFreshnessNonReuse:
+    """AC-6 / spec §7.3 — the load-bearing concurrency guarantee.
+
+    Overlapping draws from two simulated clients funnel through the ONE
+    draw card. The :class:`DeviceManager` per-read lock (devices.py)
+    serializes them, so every served block is a *unique*, contiguous
+    slice of the card's stream — no measured byte is ever served twice —
+    and the served ``generation_timestamp_ns`` values are strictly
+    ordered by serving order. A CI stand-in ``chardev`` backed by a
+    finite, strictly non-repeating stream is the witness: if the device
+    lock ever regressed, concurrent ``os.read`` calls on the shared fd
+    would interleave and the uniqueness / contiguity assertions would
+    fail loudly.
+    """
+
+    async def test_two_clients_never_reuse_and_timestamps_ordered(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(devices_mod, "_SYSFS_PCI_ROOT", str(tmp_path / "sys"))
+        block = 4096
+        draws_per_client = 16
+        total = 2 * draws_per_client
+        # The card's "FIFO": every 4-byte word is its own big-endian index, so
+        # any block-sized slice is unique and its file offset is recoverable
+        # from its first word. Sized to be consumed exactly once by all draws.
+        words = (total * block) // 4
+        stream = b"".join(w.to_bytes(4, "big") for w in range(words))
+        device = _chardev_entry(tmp_path, "dragonfly-0", PCI_0, stream, ready_count="0")
+        # One draw card, failover off — mirrors the shared qr-server topology.
+        config = make_profile_config(
+            tmp_path,
+            devices=[device],
+            controls=[],
+            profiles=[],
+            server={"listen": "127.0.0.1:0", "failover_enabled": False},
+        )
+        manager = DeviceManager(config)
+        await manager.initialize()
+        try:
+            router = SourceRouter(config, manager)
+
+            async def client() -> list:
+                reads = []
+                for _ in range(draws_per_client):
+                    reads.append(await router.read("dragonfly-0", block))
+                return reads
+
+            # Two clients drawing concurrently → overlapping requests contend
+            # for the single device lock.
+            batches = await asyncio.gather(client(), client())
+            reads = [r for batch in batches for r in batch]
+
+            # 1) Non-reuse: every served block is unique.
+            blocks = [r.data for r in reads]
+            assert len(set(blocks)) == total
+
+            # 2) Exhaustive & contiguous: the served blocks are exactly the
+            #    card stream partitioned into block-sized slices — each
+            #    measured byte served once, no gaps, no overlap.
+            by_offset = sorted(reads, key=lambda r: int.from_bytes(r.data[:4], "big"))
+            offsets = [int.from_bytes(r.data[:4], "big") * 4 for r in by_offset]
+            assert offsets == [i * block for i in range(total)]
+            assert b"".join(r.data for r in by_offset) == stream
+
+            # 3) generation_timestamp_ns strictly ordered by serving order
+            #    (serving order == offset order: the lock hands out contiguous
+            #    slices, one measurement instant per served block).
+            stamps = [r.timestamp_ns for r in by_offset]
+            assert all(
+                earlier < later
+                for earlier, later in zip(stamps[:-1], stamps[1:], strict=True)
+            )
+        finally:
+            await manager.shutdown()
 
 
 class TestWatchRead:
