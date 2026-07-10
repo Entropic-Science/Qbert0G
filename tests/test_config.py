@@ -453,7 +453,29 @@ class TestSharedQrServerConfig:
         assert config.integration.sources == ["dragonfly-0"]
         assert "dragonfly-1" not in config.integration.sources
         assert config.profiles == []  # no profile can front dragonfly-1 as a draw
-        assert config.controls == []
+        # The only controls are the two seeded PRNG study sources — pure
+        # generators that never front a card, so dragonfly-1 stays undrawable.
+        assert [(c.id, c.type) for c in config.controls] == [
+            ("prng_uniform", "prng_uniform"),
+            ("prng_markov", "prng_markov"),
+        ]
+
+    def test_prng_study_controls_are_seeded_and_markov_has_model(self):
+        """The qr-llm-research PRNG-vs-QRNG lanes (spec §3.3, FR-9).
+
+        Both controls carry an explicit 128-bit seed (offline regenerable
+        from (id, seed, stream_offset_bytes)); only prng_markov carries an
+        npz model path (fit via scripts/fit_markov.py — an operator
+        prerequisite at daemon start, not at config parse).
+        """
+        config = Config.from_dict(self._raw())
+        by_id = {c.id: c for c in config.controls}
+        assert set(by_id) == {"prng_uniform", "prng_markov"}
+        for control in by_id.values():
+            assert control.seed.startswith("0x") and len(control.seed) == 34
+            assert control.seed_int > 0
+        assert by_id["prng_markov"].model.endswith(".npz")
+        assert by_id["prng_uniform"].model == ""
 
     def test_dragonfly1_appears_only_as_coherence_reference(self):
         config = Config.from_dict(self._raw())
