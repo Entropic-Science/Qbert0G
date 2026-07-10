@@ -437,7 +437,7 @@ class TestSharedQrServerConfig:
 
     def test_shared_config_parses(self):
         config = Config.from_dict(self._raw())
-        assert config.server.unix_socket == "/run/qbert0g.sock"
+        assert config.server.unix_socket == "/run/qbert0g/qbert0g.sock"
         assert config.post_processing_mode == "raw"
         # Draw-serving keys account the whole 2 MiB block: the per-request
         # cap must clear integration.block_bytes or draws are refused.
