@@ -439,10 +439,14 @@ class TestSharedQrServerConfig:
         config = Config.from_dict(self._raw())
         assert config.server.unix_socket == "/run/qbert0g/qbert0g.sock"
         assert config.post_processing_mode == "raw"
-        # Draw-serving keys account the whole 2 MiB block: the per-request
-        # cap must clear integration.block_bytes or draws are refused.
-        assert config.limits.max_bytes_per_request >= 2_097_152
-        assert config.integration.block_bytes == 2_097_152
+        # Draw-serving keys account the whole integration block: the
+        # per-request cap must clear integration.block_bytes or draws are
+        # refused. 100 KiB per draw since the 2026-07 throughput tranche
+        # (serialized device reads made 1 MiB blocks the engine's ceiling);
+        # the cap keeps 2 MiB of headroom for legacy-sized explicit requests.
+        assert config.limits.max_bytes_per_request >= config.integration.block_bytes
+        assert config.limits.max_bytes_per_request == 2_097_152
+        assert config.integration.block_bytes == 102_400
 
     def test_both_cards_configured_but_only_dragonfly0_is_drawable(self):
         config = Config.from_dict(self._raw())
