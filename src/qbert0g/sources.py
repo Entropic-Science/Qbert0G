@@ -143,9 +143,19 @@ class SourceRouter:
         return next(iter(self._devices.devices), None)
 
     async def read(
-        self, source_id: str, num_bytes: int, timeout: float | None = None
+        self,
+        source_id: str,
+        num_bytes: int,
+        timeout: float | None = None,
+        *,
+        allowed_devices: set[str] | None = None,
     ) -> SourceRead:
         """Read *num_bytes* from any source id.
+
+        ``allowed_devices`` (when given) restricts device-level failover to
+        that set — the draw path passes ``integration.sources`` so a draw is
+        never mis-routed to a non-drawable device. Ignored for profile /
+        control ids (draws never route through those).
 
         Deferred (spec §12): blinded arm aliases (opaque ids mapping to
         profiles, sealed mapping) would resolve here, before the lookup.
@@ -157,7 +167,7 @@ class SourceRouter:
             return await asyncio.wait_for(coro, timeout)
         if source_id in self._controls:
             return await self._read_control(source_id, num_bytes)
-        return await self._read_device(source_id, num_bytes, timeout)
+        return await self._read_device(source_id, num_bytes, timeout, allowed_devices)
 
     async def watch_read(self, ids: Sequence[str], num_bytes: int) -> WatchSample:
         """One raw sample for the CLI bitstream viewer (``sources watch``).
@@ -217,11 +227,17 @@ class SourceRouter:
     # ── plain devices (delegation — behavior unchanged) ────────────────
 
     async def _read_device(
-        self, device_id: str, num_bytes: int, timeout: float | None
+        self,
+        device_id: str,
+        num_bytes: int,
+        timeout: float | None,
+        allowed_devices: set[str] | None = None,
     ) -> SourceRead:
         if timeout is None:
             timeout = self._config.server.request_timeout
-        data, serving_id = await self._devices.read_bytes(device_id, num_bytes, timeout=timeout)
+        data, serving_id = await self._devices.read_bytes(
+            device_id, num_bytes, timeout=timeout, allowed_devices=allowed_devices
+        )
         timestamp_ns = time.time_ns()
         state = self._devices.devices.get(serving_id)
         fact = {"id": serving_id, "kind": self._device_kind(serving_id), "raw_bytes": num_bytes}

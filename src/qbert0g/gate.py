@@ -171,9 +171,21 @@ class RequestGate:
                 if primary_source is None:
                     await context.abort(grpc.StatusCode.UNAVAILABLE, "No devices available")
 
+        # DRAW safety: a qr_purity draw must be served ONLY by a source in
+        # integration.sources (fingerprint-loaded / drawable). Restricting
+        # failover here means a busy draw card WAITS for itself rather than
+        # mis-routing to a non-drawable sibling (e.g. the coherence-only
+        # card) that would be rejected downstream with FAILED_PRECONDITION —
+        # safe-by-default even when server.failover_enabled is true.
+        allowed_devices = (
+            set(config.integration.sources) if protocol == "qr_purity" else None
+        )
         try:
             read = await self._router.read(
-                primary_source, num_bytes, timeout=config.server.request_timeout
+                primary_source,
+                num_bytes,
+                timeout=config.server.request_timeout,
+                allowed_devices=allowed_devices,
             )
         except TimeoutError:
             await context.abort(

@@ -56,6 +56,28 @@ class TestFailover:
         assert device_id == "mock-1"
         assert len(data) == 8
 
+    async def test_allowed_devices_blocks_failover_to_non_drawable(self, manager):
+        # Draw safety (2026-07): even with failover_enabled, a read
+        # restricted to ``allowed_devices`` must NOT serve from a device
+        # outside that set. With only the (errored) primary allowed, it
+        # waits and times out rather than mis-routing to the sibling —
+        # this is what keeps a draw off the coherence-only card.
+        import pytest
+
+        manager.devices["mock-0"].status = DeviceStatus.ERROR
+        with pytest.raises(TimeoutError):
+            await manager.read_bytes("mock-0", 8, timeout=0.2, allowed_devices={"mock-0"})
+
+    async def test_allowed_devices_permits_listed_failover(self, manager):
+        # ``allowed_devices`` is a filter, not a hard pin: a sibling that IS
+        # in the set remains a valid failover target.
+        manager.devices["mock-0"].status = DeviceStatus.ERROR
+        data, device_id = await manager.read_bytes(
+            "mock-0", 8, allowed_devices={"mock-0", "mock-1"}
+        )
+        assert device_id == "mock-1"
+        assert len(data) == 8
+
     async def test_no_failover_when_disabled(self, tmp_path):
         config = make_config(
             tmp_path,

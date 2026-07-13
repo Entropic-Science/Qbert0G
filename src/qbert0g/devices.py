@@ -525,17 +525,33 @@ class DeviceManager:
         return data
 
     async def read_bytes(
-        self, primary_device_id: str, num_bytes: int, timeout: float = 5.0
+        self,
+        primary_device_id: str,
+        num_bytes: int,
+        timeout: float = 5.0,
+        *,
+        allowed_devices: set[str] | None = None,
     ) -> tuple[bytes, str]:
         """Read bytes with failover routing.
 
         Returns ``(data, serving_device_id)``. Raises ``TimeoutError``
         when no device becomes available within *timeout* seconds.
+
+        ``allowed_devices`` (when given) restricts the failover order to
+        that set of device ids. The DRAW path passes ``integration.sources``
+        so a draw is NEVER served by a device outside the drawable set —
+        e.g. the coherence-only card, which has no loaded fingerprint and
+        would be rejected downstream with FAILED_PRECONDITION. A busy
+        primary then WAITS for itself (up to *timeout*) rather than
+        mis-routing to a sibling. Safe-by-default: this holds even when
+        ``server.failover_enabled`` is true.
         """
         if self._config.server.failover_enabled:
             fallback_order = self.get_fallback_order(primary_device_id)
         else:
             fallback_order = [primary_device_id]
+        if allowed_devices is not None:
+            fallback_order = [d for d in fallback_order if d in allowed_devices]
 
         start_time = time.monotonic()
         while (time.monotonic() - start_time) < timeout:
