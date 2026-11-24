@@ -223,10 +223,19 @@ class ProvenanceConfig:
     ``strict: false`` (default): a provenance write failure logs ERROR
     and the request is still served. ``strict: true`` inverts that for
     study runs — a request whose provenance cannot be recorded fails.
+
+    The log is bounded: when the next record would take the file past
+    ``max_bytes`` it is renamed to ``<path>.1`` (older archives shift up)
+    and the archive beyond ``keep_files`` is dropped, so at most
+    ``max_bytes * (keep_files + 1)`` is kept. ``max_bytes: 0`` keeps
+    everything in one file, which is what a study run that must retain
+    every record sets.
     """
 
     path: str = "./provenance.jsonl"
     strict: bool = False
+    max_bytes: int = 256 * 1024 * 1024
+    keep_files: int = 3
 
 
 @dataclass
@@ -503,13 +512,19 @@ class Config:
         profiles_defaults = _parse_profiles_defaults(data.get("profiles_defaults", {}) or {})
 
         prov = data.get("provenance", {}) or {}
-        _check_keys("provenance", prov, {"path", "strict"})
+        _check_keys("provenance", prov, {"path", "strict", "max_bytes", "keep_files"})
         provenance = ProvenanceConfig(
             path=str(prov.get("path", "./provenance.jsonl")),
             strict=bool(prov.get("strict", False)),
+            max_bytes=int(prov.get("max_bytes", ProvenanceConfig.max_bytes)),
+            keep_files=int(prov.get("keep_files", ProvenanceConfig.keep_files)),
         )
         if not provenance.path:
             raise ConfigError("provenance: `path` must not be empty")
+        if provenance.max_bytes < 0:
+            raise ConfigError("provenance: `max_bytes` must be >= 0 (0 keeps everything)")
+        if provenance.keep_files < 0:
+            raise ConfigError("provenance: `keep_files` must be >= 0")
 
         db = data.get("database", {}) or {}
         _check_keys("database", db, {"path"})
