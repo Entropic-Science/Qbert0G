@@ -137,13 +137,39 @@ the **same id namespace** (API keys bind to any of them):
 - **PRNG controls** (`controls:` in config) — seeded pseudorandom sources,
   loudly NOT quantum: `prng_uniform` (PCG64 raw-word stream) and
   `prng_markov` (order-1 byte Markov chain fitted to a specific card's
-  statistical fingerprint via `scripts/fit_markov.py`). Seeds are required,
-  so every served block is regenerable offline from
-  `(id, seed, stream_offset_bytes)`.
+  statistical fingerprint via `scripts/fit_markov.py`) and `prng_resample`
+  (seeded-PRNG-chosen contiguous windows of a frozen recorded device pool,
+  `scripts/record_pool.py` — the matched control for a raw stream that is
+  not uniform, since a window keeps the card's byte distribution and its
+  within-block correlation). Seeds are required, so every served block is
+  regenerable offline from `(id, seed, stream_offset_bytes)` (for
+  `prng_resample`: `(pool, seed, draw_index, n)`).
 - **Profiles** (`profiles:`) — named deterministic transforms over devices
   and/or controls: `identity`, `xnor` (agreement stream), `parity` (tapped
   XOR decimation). Typical arms: `qq-match` (xnor of two quantum cards),
   `qp-match` (quantum vs fitted control), `pp-match` (control vs control).
+
+### Raw or hashed, per request
+
+The daemon measures and serves **raw** bytes. A byte-path caller that needs
+uniform bytes can ask for `hash_truncate` on a single request by adding gRPC
+metadata (enabled by `conditioning.allow_request: true`):
+
+| Metadata key | Meaning | Default |
+|---|---|---|
+| `qr-conditioning` | `raw` or `hash_truncate` | `raw` |
+| `qr-conditioning-hash` | `sha256`, `sha512`, `sha3_256`, `blake2b` | `sha256` |
+| `qr-conditioning-in-bytes` | raw bytes hashed per digest | 128 |
+| `qr-conditioning-keep-bytes` | leading digest bytes kept | 16 |
+
+The raw read is cut into `in_bytes` blocks; each block is hashed on its own
+and only the first `keep_bytes` of its digest are served. At least half of
+every digest is always discarded and every block holds at least twice the
+bytes it yields; those two rules are fixed. The server echoes what it applied
+in the `qr-conditioning-applied` initial-metadata key and records the
+parameters and the raw block's sha256 in provenance. PurityService draws
+refuse conditioning. `scripts/conditioning_check.py dump.bin` shows what a
+raw dump looks like to a byte-mean z-score sampler under each mode.
 
 Serving rules: `device_id` in responses carries the **profile id**; byte
 caps/rate limits count **served** bytes (raw input consumption is a

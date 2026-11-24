@@ -457,12 +457,30 @@ class TestSharedQrServerConfig:
         assert config.integration.sources == ["dragonfly-0"]
         assert "dragonfly-1" not in config.integration.sources
         assert config.profiles == []  # no profile can front dragonfly-1 as a draw
-        # The only controls are the two seeded PRNG study sources — pure
-        # generators that never front a card, so dragonfly-1 stays undrawable.
+        # The only controls are the seeded PRNG study sources — none fronts
+        # a live card (prng_resample replays a frozen dragonfly-0 pool), so
+        # dragonfly-1 stays undrawable.
         assert [(c.id, c.type) for c in config.controls] == [
             ("prng_uniform", "prng_uniform"),
             ("prng_markov", "prng_markov"),
+            ("prng_resample", "prng_resample"),
         ]
+
+    def test_conditioning_is_request_selected_with_truncating_defaults(self):
+        """Raw stays the device mode; hashing is a per-request choice."""
+        config = Config.from_dict(self._raw())
+        assert config.post_processing_mode == "raw"
+        cond = config.conditioning
+        assert cond.allow_request is True
+        assert (cond.default_hash, cond.default_in_bytes, cond.default_keep_bytes) == (
+            "sha256",
+            128,
+            16,
+        )
+        # A 10,000-byte hashed request must fit the per-request raw cap.
+        assert 10_000 // cond.default_keep_bytes * cond.default_in_bytes <= (
+            config.limits.max_bytes_per_request
+        )
 
     def test_prng_study_controls_are_seeded_and_markov_has_model(self):
         """The qr-llm-research PRNG-vs-QRNG lanes (spec §3.3, FR-9).
@@ -474,12 +492,16 @@ class TestSharedQrServerConfig:
         """
         config = Config.from_dict(self._raw())
         by_id = {c.id: c for c in config.controls}
-        assert set(by_id) == {"prng_uniform", "prng_markov"}
+        assert set(by_id) == {"prng_uniform", "prng_markov", "prng_resample"}
         for control in by_id.values():
             assert control.seed.startswith("0x") and len(control.seed) == 34
             assert control.seed_int > 0
         assert by_id["prng_markov"].model.endswith(".npz")
         assert by_id["prng_uniform"].model == ""
+        # prng_resample replays a frozen recorded pool (scripts/record_pool.py
+        # — likewise an operator prerequisite at daemon start).
+        assert by_id["prng_resample"].pool.endswith(".bin")
+        assert by_id["prng_resample"].model == ""
 
     def test_dragonfly1_appears_only_as_coherence_reference(self):
         config = Config.from_dict(self._raw())

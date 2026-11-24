@@ -44,8 +44,9 @@ from .config import Config, IntegrationConfig, PurityConfig
 from .database import Database
 from .devices import DeviceManager, DeviceState, DeviceStatus
 from .fingerprint import Fingerprint, load_config_fingerprints
-from .gate import RequestGate
+from .gate import Measurement, RequestGate
 from .integrators import integrate
+from .profiles import CONDITIONING_APPLIED_HEADER
 from .proto import (
     entropy_service_pb2,
     entropy_service_pb2_grpc,
@@ -66,6 +67,19 @@ from .sources import SourceRead, SourceRouter
 logger = logging.getLogger(__name__)
 
 
+async def _echo_conditioning(context: grpc.aio.ServicerContext, m: Measurement) -> None:
+    """Tell the caller which conditioning was applied (initial metadata).
+
+    Sent only when the request carried the conditioning header, so the
+    wire is unchanged for every other caller. A client that selected a
+    mode and sees no echo is talking to a daemon that ignored it.
+    """
+    if m.conditioning_echo is not None:
+        await context.send_initial_metadata(
+            ((CONDITIONING_APPLIED_HEADER, m.conditioning_echo),)
+        )
+
+
 class QuantumRNGServicer(qrng_pb2_grpc.QuantumRNGServicer):
     """The public ``qrng.QuantumRNG`` service."""
 
@@ -76,6 +90,7 @@ class QuantumRNGServicer(qrng_pb2_grpc.QuantumRNGServicer):
         self, request: qrng_pb2.RandomRequest, context: grpc.aio.ServicerContext
     ) -> qrng_pb2.RandomResponse:
         m = await self._gate.measure(context, request.num_bytes, protocol="qrng")
+        await _echo_conditioning(context, m)
         return qrng_pb2.RandomResponse(
             data=m.data,
             timestamp=m.timestamp_ns // 1_000,  # epoch microseconds
@@ -102,6 +117,7 @@ class EntropyServicer(entropy_service_pb2_grpc.EntropyServiceServicer):
         m = await self._gate.measure(
             context, request.bytes_needed, protocol="qr_entropy", sequence_id=request.sequence_id
         )
+        await _echo_conditioning(context, m)
         return entropy_service_pb2.EntropyResponse(
             data=m.data,
             sequence_id=request.sequence_id,
@@ -117,6 +133,7 @@ class EntropyServicer(entropy_service_pb2_grpc.EntropyServiceServicer):
         through the full gate — auth, rate limit, caps — exactly like a
         unary call.
         """
+        echoed = False
         async for request in request_iterator:
             m = await self._gate.measure(
                 context,
@@ -124,6 +141,11 @@ class EntropyServicer(entropy_service_pb2_grpc.EntropyServiceServicer):
                 protocol="qr_entropy",
                 sequence_id=request.sequence_id,
             )
+            if not echoed:
+                # Conditioning comes from the stream's invocation metadata,
+                # so it is the same for every message: echo it once.
+                await _echo_conditioning(context, m)
+                echoed = True
             yield entropy_service_pb2.EntropyResponse(
                 data=m.data,
                 sequence_id=request.sequence_id,

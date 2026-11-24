@@ -126,6 +126,28 @@ controls:
   #   type: "prng_markov"
   #   model: "/etc/qthought/models/dragonfly-0_v17.npz"
   #   seed: "0x243f6a8885a308d313198a2e03707344"
+  # Seeded-PRNG-chosen contiguous windows of a frozen recorded device pool:
+  # the matched control for a NON-uniform raw stream (keeps the card's byte
+  # distribution and within-block correlation). Record the pool through the
+  # running daemon with scripts/record_pool.py; it must exist at startup.
+  # - id: "prng-resample-0"
+  #   type: "prng_resample"
+  #   pool: "/var/lib/qbert0g/pools/dragonfly-0_pool_v1.bin"
+  #   seed: "0x13198a2e03707344a4093822299f31d0"
+
+# ── Per-request conditioning ─────────────────────────────────────────────────
+# Off unless enabled. When on, a byte-path request may select
+# `qr-conditioning: hash_truncate` in its gRPC metadata (optional
+# qr-conditioning-hash / -in-bytes / -keep-bytes): the raw read is cut into
+# in_bytes blocks, each hashed on its own, and only the first keep_bytes of
+# each digest are served. Fixed rules: keep_bytes <= half the digest,
+# in_bytes >= 2 * keep_bytes. Requests without the header get raw.
+# conditioning:
+#   allow_request: true
+#   default_hash: sha256
+#   default_in_bytes: 128
+#   default_keep_bytes: 16
+#   max_in_bytes: 4096
 
 # ── Profiles ─────────────────────────────────────────────────────────────────
 # Named deterministic transforms over devices/controls (never over other

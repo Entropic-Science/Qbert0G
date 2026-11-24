@@ -20,6 +20,17 @@ offline from ``(source_id, seed, stream_offset_bytes)`` alone:
   replays the chain from the stream start
   (see :func:`markov_stream_bytes`).
 
+- ``prng_resample`` — a matched control for a NON-uniform raw device
+  stream. A frozen pool of raw device bytes is recorded once
+  (``scripts/record_pool.py``); each request the seeded PRNG picks ONE
+  contiguous window of the requested length from it. A window is a real
+  device read, so it carries the device's byte distribution AND its
+  within-block correlation — the part an i.i.d. or order-1 model loses.
+  The choice of window is pseudorandom and the pool is historical, so
+  nothing measured at request time enters the output. Regenerable
+  offline from ``(pool, seed, draw_index, n)``
+  (see :func:`resample_window_bytes`).
+
 Layering: imports nothing internal except :mod:`.config`.
 """
 
@@ -196,8 +207,105 @@ class PrngMarkovControl:
         return data
 
 
-def make_control(config: ControlConfig) -> PrngUniformControl | PrngMarkovControl:
+# ── resample ─────────────────────────────────────────────────────────────
+
+#: A pool smaller than this cannot give a study meaningfully distinct
+#: windows; refused at startup.
+MIN_POOL_BYTES = 1_048_576
+
+
+def resample_window_offset(seed: int, draw_index: int, pool_bytes: int, n: int) -> int:
+    """Start offset of draw *draw_index*'s window of *n* bytes.
+
+    One PCG64(seed) 64-bit raw output per draw (``advance`` makes any
+    draw index O(1)-seekable), reduced modulo the number of valid start
+    positions ``pool_bytes - n + 1``. The modulo bias is below 2**-30
+    for any pool this daemon accepts.
+    """
+    if n < 1 or n > pool_bytes:
+        raise ValueError(
+            f"prng_resample: a request must be between 1 and the pool size "
+            f"({pool_bytes} bytes), got {n}"
+        )
+    bit_gen = PCG64(seed)
+    if draw_index:
+        bit_gen.advance(draw_index)
+    return int(bit_gen.random_raw(1)[0]) % (pool_bytes - n + 1)
+
+
+def resample_window_bytes(pool_path: str, seed: int, draw_index: int, n: int) -> bytes:
+    """Offline regeneration of the bytes served by draw *draw_index*."""
+    pool_bytes = Path(pool_path).stat().st_size
+    offset = resample_window_offset(seed, draw_index, pool_bytes, n)
+    with open(pool_path, "rb") as f:
+        f.seek(offset)
+        return f.read(n)
+
+
+def pool_sha256(path: str) -> tuple[int, str]:
+    """``(size_bytes, sha256)`` of a recorded pool, streamed in 1 MiB chunks."""
+    pool_path = Path(path)
+    if not pool_path.is_file():
+        raise ConfigError(f"prng_resample pool file not found: {path}")
+    digest = hashlib.sha256()
+    size = 0
+    with open(pool_path, "rb") as f:
+        while chunk := f.read(1_048_576):
+            digest.update(chunk)
+            size += len(chunk)
+    return size, digest.hexdigest()
+
+
+class PrngResampleControl:
+    """Seeded window resampler over a frozen recorded device pool. NOT quantum.
+
+    The bytes it serves were once measured on a quantum device, but
+    which bytes are served is decided by a seeded PRNG and the pool is
+    fixed before the run: ``kind`` is ``"prng"``, never ``"quantum"``.
+    """
+
+    kind = "prng"
+
+    def __init__(self, config: ControlConfig) -> None:
+        _warn_not_quantum(config)
+        self.config = config
+        self.pool_bytes, self.pool_sha256 = pool_sha256(config.pool)
+        if self.pool_bytes < MIN_POOL_BYTES:
+            raise ConfigError(
+                f"prng_resample pool {config.pool}: {self.pool_bytes} bytes is below "
+                f"the {MIN_POOL_BYTES}-byte minimum"
+            )
+        self._seed = config.seed_int
+        self.draw_index = 0  # one window per request; persists for the session
+        self.stream_offset_bytes = 0  # bytes served so far (interface parity)
+        self.last_window_offset: int | None = None
+
+    def read(self, n: int) -> bytes:
+        """One PRNG-chosen contiguous window of *n* pool bytes."""
+        if n <= 0:
+            return b""
+        offset = resample_window_offset(self._seed, self.draw_index, self.pool_bytes, n)
+        with open(self.config.pool, "rb") as f:
+            f.seek(offset)
+            data = f.read(n)
+        if len(data) != n:
+            raise OSError(
+                f"prng_resample pool {self.config.pool} changed size since startup "
+                f"(read {len(data)} of {n} bytes at offset {offset})"
+            )
+        self.last_window_offset = offset
+        self.draw_index += 1
+        self.stream_offset_bytes += n
+        return data
+
+
+Control = PrngUniformControl | PrngMarkovControl | PrngResampleControl
+
+
+def make_control(config: ControlConfig) -> Control:
     """Construct the control for a validated :class:`ControlConfig`."""
     if config.type == "prng_uniform":
         return PrngUniformControl(config)
+    if config.type == "prng_resample":
+        return PrngResampleControl(config)
     return PrngMarkovControl(config)
