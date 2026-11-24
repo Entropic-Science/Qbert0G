@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from collections.abc import Sequence
@@ -90,20 +91,44 @@ class ProvenanceLog:
     raises :class:`ProvenanceWriteError` so the gate fails the request
     (study runs must not serve unrecorded bytes).
 
+    The log is bounded: ``max_bytes`` per file and ``keep_files`` archives,
+    ``<path>.1`` the newest. ``max_bytes=0`` never rotates. A failed
+    rotation is a failed write.
+
     Deferred (spec §12): a rolling statistics monitor (per-source
     bit-position / ACF windows) would hook here; the JSONL already
     carries enough to compute those offline.
     """
 
-    def __init__(self, path: str, strict: bool) -> None:
+    def __init__(self, path: str, strict: bool, max_bytes: int = 0, keep_files: int = 0) -> None:
         self._path = path
         self._strict = strict
+        self._max_bytes = max_bytes
+        self._keep_files = keep_files
+
+    def _rotate_if_full(self, incoming: int) -> None:
+        """Make room for *incoming* bytes: shift the archives, drop the oldest."""
+        if not self._max_bytes:
+            return
+        try:
+            if os.path.getsize(self._path) + incoming <= self._max_bytes:
+                return
+        except FileNotFoundError:
+            return
+        if not self._keep_files:
+            os.remove(self._path)
+            return
+        for index in range(self._keep_files, 0, -1):
+            source = self._path if index == 1 else f"{self._path}.{index - 1}"
+            if os.path.exists(source):
+                os.replace(source, f"{self._path}.{index}")
 
     def write(self, record: dict) -> None:
-        line = json.dumps(record, separators=(",", ":"))
+        line = json.dumps(record, separators=(",", ":")) + "\n"
         try:
-            with open(self._path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            self._rotate_if_full(len(line))
+            with open(self._path, "a", encoding="utf-8", newline="\n") as f:
+                f.write(line)
         except OSError as exc:
             if self._strict:
                 raise ProvenanceWriteError(
@@ -134,7 +159,8 @@ class SourceRouter:
         self._profiles = {prof.id: Profile(prof) for prof in config.profiles}
         self._chunk_bytes = config.profiles_defaults.chunk_bytes
         self._max_skew_ns = config.profiles_defaults.max_skew_ns
-        self.provenance = ProvenanceLog(config.provenance.path, config.provenance.strict)
+        prov = config.provenance
+        self.provenance = ProvenanceLog(prov.path, prov.strict, prov.max_bytes, prov.keep_files)
 
     # ── resolution ─────────────────────────────────────────────────────
 

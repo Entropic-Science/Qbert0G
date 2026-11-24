@@ -377,13 +377,29 @@ class TestProvenance:
         config = Config.from_dict(_minimal())
         assert config.provenance.path == "./provenance.jsonl"
         assert config.provenance.strict is False
+        assert config.provenance.max_bytes == 256 * 1024 * 1024
+        assert config.provenance.keep_files == 3
 
     def test_overrides(self):
         config = Config.from_dict(
-            _minimal(provenance={"path": "/var/log/qbert0g/prov.jsonl", "strict": True})
+            _minimal(
+                provenance={
+                    "path": "/var/log/qbert0g/prov.jsonl",
+                    "strict": True,
+                    "max_bytes": 0,
+                    "keep_files": 0,
+                }
+            )
         )
         assert config.provenance.path == "/var/log/qbert0g/prov.jsonl"
         assert config.provenance.strict is True
+        assert config.provenance.max_bytes == 0
+        assert config.provenance.keep_files == 0
+
+    @pytest.mark.parametrize("key", ["max_bytes", "keep_files"])
+    def test_negative_retention_rejected(self, key):
+        with pytest.raises(ConfigError, match=key):
+            Config.from_dict(_minimal(provenance={key: -1}))
 
     def test_unknown_key_rejected(self):
         with pytest.raises(ConfigError, match="unknown key"):

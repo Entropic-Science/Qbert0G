@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed
+
+- **The provenance log is bounded.** New `provenance.max_bytes` (default
+  256 MiB) and `provenance.keep_files` (default 3): when the next record
+  would take the file past `max_bytes` it is rotated to `<path>.1` and the
+  archive beyond `keep_files` is dropped. The log used to grow without limit
+  (21 GB in five months on the shared box). `max_bytes: 0` restores the old
+  behaviour for study runs that must keep every record. A rotation failure is
+  a write failure, so `strict` covers it.
+
 ### Added
 
 - **Per-request conditioning: `hash_truncate`** — new `conditioning:` config

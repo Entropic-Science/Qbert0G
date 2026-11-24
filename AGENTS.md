@@ -58,7 +58,8 @@ them directly for the offline commands (`draws pull`, `coherence null`,
 - `sources.py` — `SourceRouter`: ONE id namespace over devices + controls +
   profiles; paired-read choreography (lexicographic lock order, alternating
   chunks, skew measurement); `ProvenanceLog` (append-only JSONL, one record
-  per served request); `watch_read` (raw device samples for the CLI
+  per served request, size-bounded by `provenance.max_bytes` /
+  `keep_files`); `watch_read` (raw device samples for the CLI
   `sources watch` bitstream viewer, through the same paired-read path).
 - `fingerprint.py` — frozen per-source statistical baselines (QPI):
   `load_fingerprint(path) -> (Fingerprint, sha256)`, loud validation incl. a

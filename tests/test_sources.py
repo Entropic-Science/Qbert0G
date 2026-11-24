@@ -242,6 +242,45 @@ class TestProvenance:
             log.write({"x": 1})
 
 
+    def test_rotation_bounds_the_log(self, tmp_path):
+        path = tmp_path / "prov.jsonl"
+        records = [{"n": n} for n in range(100, 116)]  # equal width: 4 fit under 40 bytes
+        log = ProvenanceLog(str(path), strict=True, max_bytes=40, keep_files=2)
+        for record in records:
+            log.write(record)
+
+        def read(name):
+            return [json.loads(line) for line in (tmp_path / name).read_text().splitlines()]
+
+        # The newest records are in the live file, older ones in .1 then .2;
+        # the first file's worth has been dropped.
+        assert read("prov.jsonl") == records[12:]
+        assert read("prov.jsonl.1") == records[8:12]
+        assert read("prov.jsonl.2") == records[4:8]
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            "prov.jsonl",
+            "prov.jsonl.1",
+            "prov.jsonl.2",
+        ]
+
+    def test_rotation_without_archives_starts_over(self, tmp_path):
+        path = tmp_path / "prov.jsonl"
+        log = ProvenanceLog(str(path), strict=True, max_bytes=20, keep_files=0)
+        for n in range(5):
+            log.write({"n": n})
+        assert [json.loads(line)["n"] for line in path.read_text().splitlines()][-1] == 4
+        assert path.stat().st_size <= 20
+        assert [p.name for p in tmp_path.iterdir()] == ["prov.jsonl"]
+
+    def test_zero_max_bytes_never_rotates(self, tmp_path):
+        path = tmp_path / "prov.jsonl"
+        log = ProvenanceLog(str(path), strict=True, max_bytes=0, keep_files=3)
+        for n in range(50):
+            log.write({"n": n})
+        assert len(path.read_text().splitlines()) == 50
+        assert [p.name for p in tmp_path.iterdir()] == ["prov.jsonl"]
+
+
 class TestDescribe:
     async def test_rows_cover_all_kinds(self, router):
         rows = {r["id"]: r for r in router.describe()}
