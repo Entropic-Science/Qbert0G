@@ -4,6 +4,29 @@
 
 ### Added
 
+- **Per-request conditioning: `hash_truncate`** — new `conditioning:` config
+  section (`allow_request`, `hashes`, `default_hash`, `default_in_bytes`,
+  `default_keep_bytes`, `max_in_bytes`; off by default). A byte-path request
+  selects it in gRPC metadata (`qr-conditioning: hash_truncate` plus optional
+  `qr-conditioning-hash` / `-in-bytes` / `-keep-bytes`); the gate reads the
+  raw bytes the transform needs, hashes each `in_bytes` block on its own and
+  serves the first `keep_bytes` of each digest. `keep_bytes <= digest // 2`
+  and `in_bytes >= 2 * keep_bytes` are fixed in code. The applied conditioning
+  is echoed in initial metadata (`qr-conditioning-applied`) and recorded, with
+  the raw block's sha256, under `conditioning` in the provenance record. The
+  per-request byte cap is checked against the raw bytes read. Requests with no
+  header are served raw exactly as before; PurityService draws refuse
+  conditioning. No proto change.
+- **`prng_resample` control** — seeded PCG64 picks one contiguous window per
+  request from a frozen recorded device pool (`pool:` path; sha256 and size
+  checked at startup, minimum 1 MiB). The matched control for a non-uniform
+  raw stream. Provenance facts add `pool_sha256`, `pool_bytes`, `draw_index`,
+  `window_offset`; `controls.resample_window_bytes` regenerates a served block
+  offline.
+- **Scripts** — `scripts/record_pool.py` records a pool through the running
+  daemon; `scripts/conditioning_check.py` reports the block-draw statistics of
+  a raw dump under raw, hash_truncate and resample.
+
 - **SourceRouter: profiles and controls are servable sources** — devices,
   PRNG controls and profiles form ONE id namespace; API keys bind to any of
   them (`qbert0g keys create --device qq-match`) and `device_id` in both

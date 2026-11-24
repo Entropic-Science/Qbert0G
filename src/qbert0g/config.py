@@ -42,7 +42,17 @@ ONE_SHOT_LIMITS = {"firefly": 35_200, "dragonfly": 35_200, "qcicada": 13_440}
 #: PRNG control source types. Both are seeded pseudorandom generators —
 #: loudly NOT quantum (see controls.py). ``prng_markov`` additionally
 #: needs an npz model file (fit with scripts/fit_markov.py).
-CONTROL_TYPES = frozenset({"prng_uniform", "prng_markov"})
+CONTROL_TYPES = frozenset({"prng_uniform", "prng_markov", "prng_resample"})
+# ``prng_resample`` replays seeded-PRNG-chosen contiguous windows of a
+# frozen recorded device pool (record with scripts/record_pool.py).
+
+#: Request-selected conditioning modes (profiles.py holds the normative
+#: transform). ``raw`` serves the measured bytes untouched.
+CONDITIONING_MODES = frozenset({"raw", "hash_truncate"})
+
+#: Hashes hash_truncate may use -> digest size in bytes. All are stdlib
+#: ``hashlib`` names with a fixed-length digest.
+CONDITIONING_HASHES = {"sha256": 32, "sha512": 64, "sha3_256": 32, "blake2b": 64}
 
 #: Profile transform name -> required input count. The transform
 #: implementations live in profiles.py; the arity map lives HERE so
@@ -170,10 +180,11 @@ class ControlConfig:
     """
 
     id: str
-    type: str  # prng_uniform | prng_markov
+    type: str  # prng_uniform | prng_markov | prng_resample
     seed: str  # 128-bit hex, "0x" + 32 hex digits; REQUIRED
     model: str = ""  # npz model path; prng_markov only
     fingerprint: str = ""  # fingerprint JSON path (QPI draws on a control)
+    pool: str = ""  # recorded raw device pool path; prng_resample only
 
     @property
     def seed_int(self) -> int:
@@ -255,6 +266,27 @@ class CoherenceConfig:
 
 
 @dataclass
+class ConditioningConfig:
+    """Per-request conditioning of the byte path (profiles.py).
+
+    The daemon serves ``raw`` unless a request selects otherwise in its
+    gRPC metadata, and it honors a selection only when ``allow_request``
+    is true. The ``default_*`` values fill parameters a ``hash_truncate``
+    request leaves out; ``max_in_bytes`` bounds how much raw input one
+    digest may consume. The normative rules (``keep_bytes`` at most half
+    the digest, ``in_bytes`` at least twice ``keep_bytes``) are not
+    configurable.
+    """
+
+    allow_request: bool = False
+    hashes: tuple[str, ...] = tuple(sorted(CONDITIONING_HASHES))
+    default_hash: str = "sha256"
+    default_in_bytes: int = 128
+    default_keep_bytes: int = 16
+    max_in_bytes: int = 4096
+
+
+@dataclass
 class PurityConfig:
     """Purity-taxonomy serve-time knobs (purity.py)."""
 
@@ -279,6 +311,7 @@ class Config:
     integration: IntegrationConfig = field(default_factory=IntegrationConfig)
     coherence: CoherenceConfig = field(default_factory=CoherenceConfig)
     purity: PurityConfig = field(default_factory=PurityConfig)
+    conditioning: ConditioningConfig = field(default_factory=ConditioningConfig)
 
     def qcc_mode_for(self, device: DeviceConfig) -> int:
         """The qcc-cli ``-P`` integer for *device* (override or global)."""
@@ -324,6 +357,7 @@ class Config:
                 "integration",
                 "coherence",
                 "purity",
+                "conditioning",
             },
         )
 
@@ -487,6 +521,7 @@ class Config:
             data.get("coherence", {}) or {}, devices=devices, controls=controls
         )
         purity = _parse_purity(data.get("purity", {}) or {})
+        conditioning = _parse_conditioning(data.get("conditioning", {}) or {})
 
         return cls(
             server=server,
@@ -503,6 +538,7 @@ class Config:
             integration=integration,
             coherence=coherence,
             purity=purity,
+            conditioning=conditioning,
         )
 
 
@@ -511,7 +547,7 @@ def _parse_controls(entries: list, seen_ids: set[str]) -> list[ControlConfig]:
     controls: list[ControlConfig] = []
     for ctl in entries:
         section = f"controls[{ctl.get('id', '?')}]"
-        _check_keys(section, ctl, {"id", "type", "seed", "model", "fingerprint"})
+        _check_keys(section, ctl, {"id", "type", "seed", "model", "fingerprint", "pool"})
         if "id" not in ctl or "type" not in ctl:
             raise ConfigError("controls: every control needs `id` and `type`")
         if ctl["type"] not in CONTROL_TYPES:
@@ -535,6 +571,14 @@ def _parse_controls(entries: list, seen_ids: set[str]) -> list[ControlConfig]:
                 raise ConfigError(f"{section}: `model` (npz path) is required for prng_markov")
         elif "model" in ctl:
             raise ConfigError(f"{section}: `model` only applies to prng_markov")
+        if ctl["type"] == "prng_resample":
+            if not ctl.get("pool"):
+                raise ConfigError(
+                    f"{section}: `pool` (recorded raw device dump) is required "
+                    "for prng_resample"
+                )
+        elif "pool" in ctl:
+            raise ConfigError(f"{section}: `pool` only applies to prng_resample")
         controls.append(
             ControlConfig(
                 id=str(ctl["id"]),
@@ -542,6 +586,7 @@ def _parse_controls(entries: list, seen_ids: set[str]) -> list[ControlConfig]:
                 seed=str(seed),
                 model=str(ctl.get("model", "")),
                 fingerprint=str(ctl.get("fingerprint", "") or ""),
+                pool=str(ctl.get("pool", "") or ""),
             )
         )
     return controls
@@ -795,6 +840,61 @@ def _parse_purity(data: dict) -> PurityConfig:
     if purity.verify_sigma <= 0:
         raise ConfigError("purity: `verify_sigma` must be > 0")
     return purity
+
+
+def _parse_conditioning(data: dict) -> ConditioningConfig:
+    """Validate the ``conditioning:`` section.
+
+    The defaults must themselves be a legal hash_truncate selection, so a
+    request that names only the mode can never fail on the server's own
+    configuration.
+    """
+    _check_keys(
+        "conditioning",
+        data,
+        {
+            "allow_request",
+            "hashes",
+            "default_hash",
+            "default_in_bytes",
+            "default_keep_bytes",
+            "max_in_bytes",
+        },
+    )
+    hashes = tuple(str(h) for h in data.get("hashes", sorted(CONDITIONING_HASHES)) or [])
+    conditioning = ConditioningConfig(
+        allow_request=bool(data.get("allow_request", False)),
+        hashes=hashes,
+        default_hash=str(data.get("default_hash", "sha256")),
+        default_in_bytes=int(data.get("default_in_bytes", 128)),
+        default_keep_bytes=int(data.get("default_keep_bytes", 16)),
+        max_in_bytes=int(data.get("max_in_bytes", 4096)),
+    )
+    if not hashes:
+        raise ConfigError("conditioning: `hashes` must not be empty")
+    for name in hashes:
+        if name not in CONDITIONING_HASHES:
+            raise ConfigError(
+                f"conditioning: hashes entry {name!r} must be one of "
+                f"{sorted(CONDITIONING_HASHES)}"
+            )
+    if conditioning.default_hash not in hashes:
+        raise ConfigError(
+            f"conditioning: default_hash {conditioning.default_hash!r} is not in `hashes`"
+        )
+    digest_size = CONDITIONING_HASHES[conditioning.default_hash]
+    if not 1 <= conditioning.default_keep_bytes <= digest_size // 2:
+        raise ConfigError(
+            f"conditioning: default_keep_bytes must be between 1 and {digest_size // 2} "
+            f"for {conditioning.default_hash} (at least half of every digest is discarded)"
+        )
+    if conditioning.default_in_bytes < 2 * conditioning.default_keep_bytes:
+        raise ConfigError(
+            "conditioning: default_in_bytes must be at least 2 * default_keep_bytes"
+        )
+    if conditioning.max_in_bytes < conditioning.default_in_bytes:
+        raise ConfigError("conditioning: max_in_bytes must be >= default_in_bytes")
+    return conditioning
 
 
 def _parse_profiles_defaults(pd: dict) -> ProfilesDefaultsConfig:

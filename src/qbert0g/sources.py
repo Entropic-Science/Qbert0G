@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from .config import Config
-from .controls import PrngMarkovControl, PrngUniformControl, make_control
+from .controls import Control, PrngMarkovControl, PrngResampleControl, make_control
 from .devices import DeviceManager, DeviceState, DeviceStatus
 from .profiles import Profile
 
@@ -125,7 +125,7 @@ class SourceRouter:
     def __init__(self, config: Config, devices: DeviceManager) -> None:
         self._config = config
         self._devices = devices
-        self._controls: dict[str, PrngUniformControl | PrngMarkovControl] = {
+        self._controls: dict[str, Control] = {
             ctl.id: make_control(ctl) for ctl in config.controls
         }
         # Per-control serialization: stream_offset_bytes must describe a
@@ -276,9 +276,14 @@ class SourceRouter:
         control = self._controls[control_id]
         async with self._control_locks[control_id]:
             offset_before = control.stream_offset_bytes
+            draw_before = getattr(control, "draw_index", None)
             # Markov generation is one python-loop step per byte — keep
             # the event loop responsive for large requests.
-            data = await asyncio.to_thread(control.read, num_bytes)
+            try:
+                data = await asyncio.to_thread(control.read, num_bytes)
+            except (ValueError, OSError) as exc:
+                raise SourceUnavailableError(f"control {control_id!r}: {exc}") from exc
+            window_offset = getattr(control, "last_window_offset", None)
         fact = {
             "id": control_id,
             "kind": "prng",
@@ -288,6 +293,14 @@ class SourceRouter:
         }
         if isinstance(control, PrngMarkovControl):
             fact["model_sha256"] = control.model_sha256
+        if isinstance(control, PrngResampleControl):
+            # Regeneration facts: the window is pool[window_offset :
+            # window_offset + raw_bytes], re-derivable from
+            # (seed, draw_index, pool size) — see controls.py.
+            fact["pool_sha256"] = control.pool_sha256
+            fact["pool_bytes"] = control.pool_bytes
+            fact["draw_index"] = draw_before
+            fact["window_offset"] = window_offset
         return data, fact
 
     # ── profiles ────────────────────────────────────────────────────────

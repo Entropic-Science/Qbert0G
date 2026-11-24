@@ -166,3 +166,81 @@ class TestLegacyMethodPath:
             assert ticket.echo_verified is False  # field 2 is a timestamp there
         finally:
             await _call(source.close)
+
+
+class TestConditioningSeam:
+    """qr-sampler asks for hash_truncate; Qbert0G applies, echoes, records.
+
+    The two repos each carry their half of the contract (metadata keys,
+    canonical echo string, the truncation rules); this is the only test
+    where the real client meets the real server.
+    """
+
+    @pytest.fixture
+    async def cond_address(self, tmp_path):
+        from conftest import SEED_A, make_config
+
+        from qbert0g.server import QbertServer
+
+        config = make_config(
+            tmp_path,
+            controls=[{"id": "prng-a", "type": "prng_uniform", "seed": SEED_A}],
+            conditioning={"allow_request": True},
+        )
+        srv = QbertServer(config)
+        await srv.start()
+        raw_key, _ = await srv.db.create_api_key(name="ctl", primary_device_id="prng-a")
+        try:
+            yield f"127.0.0.1:{srv.port}", raw_key, config
+        finally:
+            await srv.stop(grace=0.5)
+
+    @pytest.mark.parametrize("mode", ["unary", "bidi_streaming"])
+    async def test_hashed_bytes_replay_from_provenance(self, cond_address, mode):
+        import json
+        from pathlib import Path
+
+        from qr_sampler.config.conditioning import Conditioning
+
+        from qbert0g.controls import uniform_stream_bytes
+        from qbert0g.profiles import hash_truncate
+
+        address, raw_key, config = cond_address
+        selection = Conditioning("hash_truncate", "sha256", 128, 16)
+        source = QuantumGrpcSource(
+            QRSamplerConfig(
+                grpc_server_address=address,
+                grpc_api_key=raw_key,
+                grpc_mode=mode,
+                fallback_mode="error",
+            )
+        )
+        try:
+            data = await _call(source.get_random_bytes, 1000, selection)
+        finally:
+            await _call(source.close)
+        assert len(data) == 1000
+
+        record = json.loads(Path(config.provenance.path).read_text().splitlines()[-1])
+        fact, cond = record["inputs"][0], record["conditioning"]
+        assert fact["kind"] == "prng"
+        assert fact["raw_bytes"] == selection.raw_bytes_needed(1000) == 8064
+        raw = uniform_stream_bytes(
+            int(fact["seed"], 16), fact["stream_offset_bytes"], fact["raw_bytes"]
+        )
+        assert hash_truncate(raw, 1000, cond["hash"], cond["in_bytes"], cond["keep_bytes"]) == data
+
+    async def test_server_with_conditioning_off_never_yields_raw_as_hashed(self, address):
+        """Default server config refuses; the client surfaces unavailable."""
+        from qr_sampler.config.conditioning import Conditioning
+        from qr_sampler.exceptions import EntropyUnavailableError
+
+        source = _source(address, grpc_retry_count=0)
+        try:
+            with pytest.raises(EntropyUnavailableError):
+                await _call(
+                    source.get_random_bytes, 64, Conditioning("hash_truncate", "sha256", 128, 16)
+                )
+            assert len(await _call(source.get_random_bytes, 64)) == 64
+        finally:
+            await _call(source.close)

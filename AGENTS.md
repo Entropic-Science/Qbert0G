@@ -46,12 +46,15 @@ them directly for the offline commands (`draws pull`, `coherence null`,
   single pre-measurement seam for all device types. The SourceRouter seam
   (`acquire_for_profile` + `read_chunk_locked`) holds ONE device with a
   single request-start flush for chunked paired reads.
-- `controls.py` — seeded PRNG sources (`prng_uniform`, `prng_markov`),
-  loudly NOT quantum; every served block regenerable offline from
-  `(id, seed, stream_offset_bytes)`.
+- `controls.py` — seeded PRNG sources (`prng_uniform`, `prng_markov`,
+  `prng_resample`), loudly NOT quantum; every served block regenerable
+  offline from `(id, seed, stream_offset_bytes)` — for `prng_resample`
+  from `(pool, seed, draw_index, n)`: it serves PRNG-chosen contiguous
+  windows of a frozen recorded device pool.
 - `profiles.py` — pure NORMATIVE transforms (`identity`, `xnor`, `parity`;
   bit order = numpy unpackbits/packbits, MSB first) + the `Profile`
-  descriptor. No I/O.
+  descriptor, and the request-selected `hash_truncate` conditioning
+  (`Conditioning`, metadata parsing, the fixed truncation rules). No I/O.
 - `sources.py` — `SourceRouter`: ONE id namespace over devices + controls +
   profiles; paired-read choreography (lexicographic lock order, alternating
   chunks, skew measurement); `ProvenanceLog` (append-only JSONL, one record
@@ -70,7 +73,8 @@ them directly for the offline commands (`draws pull`, `coherence null`,
   via `SourceRouter.coherence_pair_read`).
 - `gate.py` — `RequestGate.measure(context, n, protocol=..., sequence_id=...,
   requested_source_id=..., provenance_extras=...)`:
-  auth → rate limit → byte caps → source read → provenance → usage record.
+  auth → rate limit → conditioning → byte caps → source read → provenance
+  → usage record.
   **Every RPC of all three services goes through this one method**; never add
   a second validation path. API keys bind to ANY source id.
 - `server.py` — the three servicers + `QpiContext` composition +
@@ -105,7 +109,10 @@ Load-bearing details:
 4. **`post_processing.mode: raw` and the pre-read buffer flush are the
    research contract** for qthought (raw noise, freshly measured, never
    pooled). Config guards (`allow_pooling: false`, unknown-key rejection)
-   keep this auditable; don't weaken them.
+   keep this auditable; don't weaken them. Raw is what every request gets
+   unless it asks otherwise: `hash_truncate` is selected per request in
+   gRPC metadata, never by a server default, and is always echoed
+   (`qr-conditioning-applied`) and recorded in provenance.
 5. **Entropy locality is deployment policy, not code**: binding `0.0.0.0` is
    allowed but warned. qthought deployments bind loopback/UDS only.
 6. **Profiles never fail over.** An experiment arm's composition is fixed:
@@ -143,6 +150,21 @@ Load-bearing details:
     for ids in `integration.sources`. Success responses never carry `u`
     outside `(1e-10, 1 - 1e-10)`; `sequence_id` is echoed verbatim.
 
+13. **Hashing is always truncated, explicit and recorded.** `hash_truncate`
+    keeps at most half of every digest (`keep_bytes <= digest // 2`) and
+    reads at least twice what it yields (`in_bytes >= 2 * keep_bytes`);
+    both rules are code, not config. It never applies unless the request
+    asked for it, never to a PurityService draw (integrators are referenced
+    to the raw fingerprint), and it never changes a source's `kind` — a
+    hashed PRNG control is still `"prng"`. The provenance record carries
+    the parameters and the raw block's sha256, so replay is: regenerate or
+    load the raw block, re-apply, compare bytes.
+14. **A `prng_resample` pool is frozen and never fed from live reads.** The
+    control serves windows of a file recorded before the run; it holds no
+    rolling buffer. That is what keeps it a control (nothing measured at
+    request time reaches its output) and keeps it outside the no-pooling
+    contract, which governs quantum sources.
+
 ## How to extend
 
 - **New device type**: add to `DEVICE_TYPES` (+ `QCC_DEVICE_TYPES` and
@@ -166,6 +188,13 @@ Load-bearing details:
   `make_control` + `config.py:CONTROL_TYPES`. Keep it seeded and offline-
   regenerable — record whatever facts regeneration needs in the provenance
   fact (see `SourceRouter._control_bytes`).
+- **New conditioning mode or hash**: mode name in
+  `config.py:CONDITIONING_MODES` (hash + digest size in
+  `CONDITIONING_HASHES`), pure function in `profiles.py`, branches in
+  `Conditioning.raw_bytes_needed` / `apply` / `canonical`, validation in
+  `validate_conditioning`, golden vectors + a provenance-replay test in
+  `tests/test_conditioning.py`. The gate needs no change. Mirror the
+  metadata keys in qr-sampler's gRPC source.
 - **New integrator**: pure function `(raw: bytes, fp: Fingerprint) ->
   IntegrationResult` in `integrators.py` + an entry in its `_INTEGRATORS`
   dispatch dict + the name added to `config.py:INTEGRATOR_TYPES` (the module

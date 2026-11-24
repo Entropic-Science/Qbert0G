@@ -44,8 +44,9 @@ from .config import Config, IntegrationConfig, PurityConfig
 from .database import Database
 from .devices import DeviceManager, DeviceState, DeviceStatus
 from .fingerprint import Fingerprint, load_config_fingerprints
-from .gate import RequestGate
+from .gate import Measurement, RequestGate
 from .integrators import integrate
+from .profiles import CONDITIONING_APPLIED_HEADER
 from .proto import (
     entropy_service_pb2,
     entropy_service_pb2_grpc,
@@ -66,6 +67,19 @@ from .sources import SourceRead, SourceRouter
 logger = logging.getLogger(__name__)
 
 
+async def _echo_conditioning(context: grpc.aio.ServicerContext, m: Measurement) -> None:
+    """Tell the caller which conditioning was applied (initial metadata).
+
+    Sent only when the request carried the conditioning header, so the
+    wire is unchanged for every other caller. A client that selected a
+    mode and sees no echo is talking to a daemon that ignored it.
+    """
+    if m.conditioning_echo is not None:
+        await context.send_initial_metadata(
+            ((CONDITIONING_APPLIED_HEADER, m.conditioning_echo),)
+        )
+
+
 class QuantumRNGServicer(qrng_pb2_grpc.QuantumRNGServicer):
     """The public ``qrng.QuantumRNG`` service."""
 
@@ -76,6 +90,7 @@ class QuantumRNGServicer(qrng_pb2_grpc.QuantumRNGServicer):
         self, request: qrng_pb2.RandomRequest, context: grpc.aio.ServicerContext
     ) -> qrng_pb2.RandomResponse:
         m = await self._gate.measure(context, request.num_bytes, protocol="qrng")
+        await _echo_conditioning(context, m)
         return qrng_pb2.RandomResponse(
             data=m.data,
             timestamp=m.timestamp_ns // 1_000,  # epoch microseconds
@@ -102,6 +117,7 @@ class EntropyServicer(entropy_service_pb2_grpc.EntropyServiceServicer):
         m = await self._gate.measure(
             context, request.bytes_needed, protocol="qr_entropy", sequence_id=request.sequence_id
         )
+        await _echo_conditioning(context, m)
         return entropy_service_pb2.EntropyResponse(
             data=m.data,
             sequence_id=request.sequence_id,
@@ -117,6 +133,7 @@ class EntropyServicer(entropy_service_pb2_grpc.EntropyServiceServicer):
         through the full gate — auth, rate limit, caps — exactly like a
         unary call.
         """
+        echoed = False
         async for request in request_iterator:
             m = await self._gate.measure(
                 context,
@@ -124,6 +141,11 @@ class EntropyServicer(entropy_service_pb2_grpc.EntropyServiceServicer):
                 protocol="qr_entropy",
                 sequence_id=request.sequence_id,
             )
+            if not echoed:
+                # Conditioning comes from the stream's invocation metadata,
+                # so it is the same for every message: echo it once.
+                await _echo_conditioning(context, m)
+                echoed = True
             yield entropy_service_pb2.EntropyResponse(
                 data=m.data,
                 sequence_id=request.sequence_id,
@@ -392,7 +414,33 @@ class QbertServer:
         logger.info("Database connected (%s)", config.database_path)
 
         await self.devices.initialize()
-        logger.info("Initialized %d device(s)", len(self.devices.devices))
+        online = [
+            dev_id
+            for dev_id, state in self.devices.devices.items()
+            if state.status is not DeviceStatus.ERROR
+        ]
+        failed = sorted(set(self.devices.devices) - set(online))
+        # Fail-fast when EVERY configured device failed to open (2026-08-06
+        # incident: a kernel upgrade without a dfqrng rebuild left /dev/qrngDF*
+        # absent; the daemon started device-less and served gRPC timeouts for a
+        # week while every caller silently fell back to PRNG). A daemon with
+        # zero working devices cannot serve a single honest byte — exiting lets
+        # systemd's Restart=on-failure cycle loudly until the driver is back.
+        # A PARTIAL failure still serves (dragonfly-1 is coherence-only; losing
+        # it must not take down the draw path).
+        if self.devices.devices and not online:
+            raise RuntimeError(
+                f"All {len(self.devices.devices)} configured device(s) failed to "
+                f"initialize: {failed}. Refusing to serve entropy with no working "
+                "device — check the device nodes (e.g. /dev/qrngDF*) and the "
+                "kernel driver for the running kernel."
+            )
+        logger.info(
+            "Initialized %d device(s) (%d online%s)",
+            len(self.devices.devices),
+            len(online),
+            f", FAILED: {failed}" if failed else "",
+        )
 
         # Fails loudly on a broken control (e.g. missing Markov model):
         # never start serving with a silently absent experiment arm.

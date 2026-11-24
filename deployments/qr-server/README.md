@@ -30,11 +30,13 @@ qbert0g keys create --name external   --device dragonfly-0 --max-bytes 2097152
 # `kind: "prng"` provenance records — loudly pseudorandom, never laundered.
 qbert0g keys create --name qr-sampler-prng-uniform --device prng_uniform
 qbert0g keys create --name qr-sampler-prng-markov  --device prng_markov
+qbert0g keys create --name qr-sampler-prng-resample --device prng_resample
 ```
 
-The two study keys are pasted into the shared vLLM's
-`QR_ENTROPY_SOURCE_INSTANCES` (`qbert_prng_uniform` / `qbert_prng_markov`
-instances in `qr-server.env` — see the qr-sampler profile README).
+The study keys are pasted into the shared vLLM's
+`QR_ENTROPY_SOURCE_INSTANCES` (`qbert_prng_uniform` / `qbert_prng_markov` /
+`qbert_prng_resample` instances in `qr-server.env` — see the qr-sampler
+profile README).
 
 **No key binds draws to `dragonfly-1`** — it is the coherence reference only.
 
@@ -54,6 +56,39 @@ P(1), lag-1 byte correlation) side by side — eyeball the fit before use. The
 model must validate (row-stochastic within 1e-9) or the daemon refuses to
 start. Until the npz exists, comment out the `prng_markov` control (and skip
 its key).
+
+## `prng_resample` prerequisite — record the pool first (operator step)
+
+The `prng_resample` control serves seeded-PRNG-chosen contiguous windows of a
+frozen raw dump of dragonfly-0. Record it **through the running daemon** (it
+must stay the only reader of the device nodes), with a key bound to
+dragonfly-0:
+
+```bash
+QBERT0G_API_KEY=<a dragonfly-0 key> python scripts/record_pool.py \
+    --device-id dragonfly-0 --bytes 268435456 \
+    --out /var/lib/qbert0g/pools/dragonfly-0_pool_v1.bin
+```
+
+The script prints the pool's sha256; the daemon recomputes it at startup and
+writes it into every provenance fact of the control. Pools are frozen: the
+script refuses to overwrite one. The pool does not follow later device drift,
+so re-record under a new name (and update `pool:`) between study runs. Until
+the pool exists, comment out the `prng_resample` control (and skip its key).
+
+## Per-request conditioning (`hash_truncate`)
+
+With `conditioning.allow_request: true` a byte-path caller may ask for hashed,
+truncated bytes instead of raw ones by sending `qr-conditioning:
+hash_truncate` (plus optional `qr-conditioning-hash`, `-in-bytes`,
+`-keep-bytes`) in its gRPC metadata. qr-sampler does this from its
+`qr_conditioning_*` request keys. Nothing changes for callers that send no
+header. To see what a raw dump looks like to a z-score sampler under each
+mode before choosing parameters:
+
+```bash
+python scripts/conditioning_check.py dump.bin --resample-seed 0x13198a2e03707344a4093822299f31d0
+```
 
 ## `provenance.strict: true` — recommended for study runs
 

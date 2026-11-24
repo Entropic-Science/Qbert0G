@@ -21,6 +21,11 @@ import grpc
 
 from .config import Config
 from .database import Database
+from .profiles import (
+    CONDITIONING_HEADER,
+    ConditioningError,
+    conditioning_from_metadata,
+)
 from .sources import ProvenanceWriteError, SourceRead, SourceRouter, SourceUnavailableError
 
 logger = logging.getLogger(__name__)
@@ -52,6 +57,10 @@ class Measurement:
     data: bytes
     device_id: str  # the SERVING source id: device, control, or profile
     timestamp_ns: int  # last contributing measurement (epoch ns); 0 when emission is off
+    #: Canonical string of the conditioning APPLIED, set only when the
+    #: request carried the conditioning header (the servicer echoes it in
+    #: initial metadata); None for callers that sent nothing.
+    conditioning_echo: str | None = None
 
 
 class RequestGate:
@@ -62,6 +71,14 @@ class RequestGate:
     unchanged validation pipeline. Byte caps, rate limits, and usage
     accounting apply to SERVED bytes; raw input consumption of profiles
     is a provenance fact, not a limits fact.
+
+    Per-request conditioning (``hash_truncate``, selected in request
+    metadata — see profiles.py) is resolved HERE, in the same single
+    path: the gate reads the raw bytes the transform needs, applies it,
+    and records the parameters plus the raw block's sha256 in the one
+    provenance record. The per-request byte cap is then checked against
+    the RAW bytes read (it bounds what one request may pull off a
+    device); daily usage still counts served bytes.
     """
 
     def __init__(self, config: Config, db: Database, router: SourceRouter) -> None:
@@ -125,18 +142,38 @@ class RequestGate:
                 f"Rate limit exceeded. Limit: {rate_limit} requests per minute.",
             )
 
+        # ── conditioning ────────────────────────────────────────────────
+        try:
+            conditioning = conditioning_from_metadata(metadata, config.conditioning)
+        except ConditioningError as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+        if not conditioning.is_raw and protocol == "qr_purity":
+            # Draw integrators are referenced to the RAW fingerprint of
+            # the source; a conditioned block has a different baseline.
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "PurityService draws integrate raw blocks only — conditioning "
+                "applies to the byte path (EntropyService / QuantumRNG)",
+            )
+
         # ── byte caps ───────────────────────────────────────────────────
         if num_bytes < 1:
             await context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT, "requested byte count must be at least 1"
             )
+        raw_bytes = conditioning.raw_bytes_needed(num_bytes)
         max_per_request = key_info.get("max_bytes_per_request")
         if max_per_request is None:
             max_per_request = config.limits.max_bytes_per_request
-        if num_bytes > max_per_request:
+        if raw_bytes > max_per_request:
+            detail = (
+                ""
+                if conditioning.is_raw
+                else f" ({raw_bytes} raw bytes under {conditioning.canonical()})"
+            )
             await context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
-                f"Request for {num_bytes} bytes exceeds the limit of "
+                f"Request for {num_bytes} bytes{detail} exceeds the limit of "
                 f"{max_per_request} bytes per request",
             )
         daily_limit = key_info.get("daily_byte_limit")
@@ -183,7 +220,7 @@ class RequestGate:
         try:
             read = await self._router.read(
                 primary_source,
-                num_bytes,
+                raw_bytes,
                 timeout=config.server.request_timeout,
                 allowed_devices=allowed_devices,
             )
@@ -200,6 +237,10 @@ class RequestGate:
 
         timestamp_ns = read.timestamp_ns if self._config.freshness.emit_generation_timestamp else 0
 
+        served = read.data
+        if not conditioning.is_raw:
+            served = conditioning.apply(read.data, num_bytes)
+
         extras = provenance_extras
         if callable(extras):
             # Draw-path extras depend on the measured bytes (integration
@@ -207,6 +248,10 @@ class RequestGate:
             # exactly ONE provenance record. The callable aborts the RPC
             # itself on a draw-specific failure.
             extras = await extras(read)
+        if not conditioning.is_raw:
+            # Flat-merged like every other extra; absent on raw requests
+            # so existing records keep their exact shape.
+            extras = {**(extras or {}), "conditioning": conditioning.provenance(read.data)}
 
         try:
             self._router.record_provenance(
@@ -223,5 +268,10 @@ class RequestGate:
 
         await self._db.record_usage(key_info["id"], num_bytes)
         return Measurement(
-            data=bytes(read.data), device_id=read.source_id, timestamp_ns=timestamp_ns
+            data=bytes(served),
+            device_id=read.source_id,
+            timestamp_ns=timestamp_ns,
+            conditioning_echo=(
+                conditioning.canonical() if CONDITIONING_HEADER in metadata else None
+            ),
         )
