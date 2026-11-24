@@ -392,7 +392,33 @@ class QbertServer:
         logger.info("Database connected (%s)", config.database_path)
 
         await self.devices.initialize()
-        logger.info("Initialized %d device(s)", len(self.devices.devices))
+        online = [
+            dev_id
+            for dev_id, state in self.devices.devices.items()
+            if state.status is not DeviceStatus.ERROR
+        ]
+        failed = sorted(set(self.devices.devices) - set(online))
+        # Fail-fast when EVERY configured device failed to open (2026-08-06
+        # incident: a kernel upgrade without a dfqrng rebuild left /dev/qrngDF*
+        # absent; the daemon started device-less and served gRPC timeouts for a
+        # week while every caller silently fell back to PRNG). A daemon with
+        # zero working devices cannot serve a single honest byte — exiting lets
+        # systemd's Restart=on-failure cycle loudly until the driver is back.
+        # A PARTIAL failure still serves (dragonfly-1 is coherence-only; losing
+        # it must not take down the draw path).
+        if self.devices.devices and not online:
+            raise RuntimeError(
+                f"All {len(self.devices.devices)} configured device(s) failed to "
+                f"initialize: {failed}. Refusing to serve entropy with no working "
+                "device — check the device nodes (e.g. /dev/qrngDF*) and the "
+                "kernel driver for the running kernel."
+            )
+        logger.info(
+            "Initialized %d device(s) (%d online%s)",
+            len(self.devices.devices),
+            len(online),
+            f", FAILED: {failed}" if failed else "",
+        )
 
         # Fails loudly on a broken control (e.g. missing Markov model):
         # never start serving with a silently absent experiment arm.
